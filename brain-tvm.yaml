@@ -7,6 +7,17 @@ substitutions:
   touch_delay: 80ms
   # Hold time in ms for the page button (short tap = next page)
   long_press_ms: "600"
+  # Hold on the clock page toggles the backlight between these two levels (%)
+  dim_low: "30"
+  dim_high: "100"
+  # BLE scan timing (window must be smaller than interval, WiFi needs the rest)
+  ble_interval: 160ms
+  ble_window: 120ms
+  # A device counts as "present" this long after its last advertisement
+  ble_timeout_s: "45"
+  # Trackers: forget after this many seconds without advert / alert after this many minutes of presence
+  tracker_timeout_s: "60"
+  tracker_alert_min: "5"
 
 esphome:
   comment: BrAiNTVM_ESP32
@@ -109,12 +120,49 @@ esp32_ble_tracker:
   scan_parameters:
     continuous: true
     active: false
-    interval: 320ms
-    window: 200ms
+    interval: ${ble_interval}
+    window: ${ble_window}
   on_ble_advertise:
     then:
       - lambda: |-
-          id(ble_seen)[x.address_uint64()] = millis();
+          uint64_t addr = x.address_uint64();
+          uint32_t now = millis();
+          id(ble_seen)[addr] = now;
+
+          // Tracker signature: 1 = Apple Find My (AirTag etc.), 2 = Samsung SmartTag,
+          // 3 = Tile, 4 = Chipolo, 5 = Google Find My Device network
+          using esp32_ble_tracker::ESPBTUUID;
+          uint32_t type = 0;
+          for (auto &m : x.get_manufacturer_datas()) {
+            if (m.uuid == ESPBTUUID::from_uint16(0x004C) && m.data.size() >= 2 &&
+                m.data[0] == 0x12 && m.data[1] == 0x19)
+              type = 1;
+          }
+          for (auto &sd : x.get_service_datas()) {
+            if (sd.uuid == ESPBTUUID::from_uint16(0xFD5A))
+              type = 2;
+            else if (sd.uuid == ESPBTUUID::from_uint16(0xFEED) || sd.uuid == ESPBTUUID::from_uint16(0xFD84))
+              type = 3;
+            else if (sd.uuid == ESPBTUUID::from_uint16(0xFE65))
+              type = 4;
+            else if (sd.uuid == ESPBTUUID::from_uint16(0xFEAA) && sd.data.size() >= 1 &&
+                     (sd.data[0] == 0x40 || sd.data[0] == 0x41))
+              type = 5;
+          }
+          if (type == 0) {
+            for (auto &u : x.get_service_uuids()) {
+              if (u == ESPBTUUID::from_uint16(0xFEED))
+                type = 3;
+            }
+          }
+
+          if (type != 0) {
+            auto it = id(trk_seen).find(addr);
+            if (it == id(trk_seen).end())
+              id(trk_seen)[addr] = {now, now, type};
+            else
+              it->second[1] = now;
+          }
 
 # Applies a display card JSON (called by the Card text entity)
 script:
@@ -260,6 +308,22 @@ globals:
     restore_value: false
     initial_value: "0"
 
+  # Trackers: address -> {first seen, last seen, type} (millis)
+  - id: trk_seen
+    type: std::map<uint64_t, std::array<uint32_t, 3>>
+    restore_value: false
+
+  - id: tracker_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  # Trackers that were present longer than tracker_alert_min
+  - id: tracker_alert
+    type: int
+    restore_value: false
+    initial_value: "0"
+
   - id: ble_peak
     type: int
     restore_value: false
@@ -327,6 +391,18 @@ binary_sensor:
             id(rotate_counter) = 0;
 
   # Push button of the light page, active while the touch is held on that page
+  # On as soon as a tracker was present longer than tracker_alert_min
+  - platform: template
+    name: "TrackerAlert"
+    id: tracker_alert_sensor
+    device_class: problem
+    icon: "mdi:map-marker-alert"
+    lambda: |-
+      return id(tracker_alert) > 0;
+    web_server:
+      sorting_group_id: grp_ble
+      sorting_weight: 5
+
   - platform: template
     name: "PushLight"
     id: push_light
@@ -353,6 +429,7 @@ switch:
       - esp32_ble_tracker.stop_scan:
       - lambda: |-
           id(ble_seen).clear();
+          id(trk_seen).clear();
 
 select:
   - platform: logger
@@ -568,6 +645,19 @@ sensor:
       sorting_weight: 2
 
   - platform: template
+    name: "TrackerCount"
+    id: tracker_count_sensor
+    update_interval: 5s
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: "mdi:map-marker-radius"
+    lambda: |-
+      return id(tracker_count);
+    web_server:
+      sorting_group_id: grp_ble
+      sorting_weight: 6
+
+  - platform: template
     name: "BLEPeak"
     id: ble_peak_sensor
     update_interval: 5s
@@ -634,6 +724,35 @@ text_sensor:
         sorting_group_id: grp_network
         sorting_weight: 5
 
+  # Which trackers are around and for how long (m:ss)
+  - platform: template
+    name: "TrackerInfo"
+    id: tracker_info_text
+    update_interval: 5s
+    icon: "mdi:map-marker-question"
+    web_server:
+      sorting_group_id: grp_ble
+      sorting_weight: 7
+    lambda: |-
+      static const char *names[] = {"?", "FindMy", "SmartTag", "Tile", "Chipolo", "GoogleFMD"};
+      std::string out;
+      int n = 0;
+      for (auto &kv : id(trk_seen)) {
+        if (n == 4) {
+          out += " ...";
+          break;
+        }
+        uint32_t dwell = (kv.second[1] - kv.second[0]) / 1000;
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%s%s %u:%02u", n ? ", " : "",
+                 names[kv.second[2] % 6], (unsigned) (dwell / 60), (unsigned) (dwell % 60));
+        out += buf;
+        n++;
+      }
+      if (out.empty())
+        return {"none"};
+      return out;
+
   - platform: template
     name: "NM TV Uptime"
     id: uptime_text
@@ -679,22 +798,37 @@ text_sensor:
         sorting_weight: 21
 
 interval:
-  # Drop devices not seen for 30s, update counter and peak
+  # Drop devices not seen for ble_timeout_s, update counters, peak and tracker alert
   - interval: 1s
     then:
       - lambda: |-
           uint32_t now = millis();
           for (auto iter = id(ble_seen).begin(); iter != id(ble_seen).end();) {
-            if (now - iter->second > 30000)
+            if (now - iter->second > ${ble_timeout_s} * 1000)
               iter = id(ble_seen).erase(iter);
             else
               ++iter;
           }
+
+          int trk = 0, alert = 0;
+          for (auto iter = id(trk_seen).begin(); iter != id(trk_seen).end();) {
+            if (now - iter->second[1] > ${tracker_timeout_s} * 1000) {
+              iter = id(trk_seen).erase(iter);
+              continue;
+            }
+            trk++;
+            if (iter->second[1] - iter->second[0] >= ${tracker_alert_min} * 60000)
+              alert++;
+            ++iter;
+          }
+          id(tracker_count) = trk;
+          id(tracker_alert) = alert;
           id(ble_count) = id(ble_seen).size();
           if (id(ble_count) > id(ble_peak))
             id(ble_peak) = id(ble_count);
 
   # Hold detection: after long_press_ms the page button of the current page goes active
+  # (clock page: toggles the dimmer instead)
   - interval: 50ms
     then:
       - lambda: |-
@@ -706,6 +840,11 @@ interval:
           id(rotate_counter) = 0;
           if (id(screen_page) == 5)
             id(push_light).publish_state(true);
+          if (id(screen_page) == 3) {
+            auto call = id(backlight_pct).make_call();
+            call.set_value(id(backlight_pct).state > (${dim_low} + ${dim_high}) / 2.0f ? ${dim_low} : ${dim_high});
+            call.perform();
+          }
 
   # Automatic page rotation
   - interval: 1s
@@ -990,8 +1129,9 @@ display:
 
       // PAGE 4: BLE SCANNER
       else if (id(screen_page) == 4) {
+        bool trk_alert = id(tracker_alert) > 0;
         it.rectangle(4, 4, 232, 232,
-                     Color(0, 180, 70));
+                     trk_alert ? Color(255, 80, 0) : Color(0, 180, 70));
 
         it.filled_rectangle(5, 5, 230, 28,
                             Color(0, 65, 30));
@@ -1007,7 +1147,7 @@ display:
 
         it.print(120, 125, id(terminal_font),
                  Color(0, 200, 90),
-                 TextAlign::TOP_CENTER, "DEVICES (LAST 30s)");
+                 TextAlign::TOP_CENTER, "DEVICES (LAST ${ble_timeout_s}s)");
 
         it.line(15, 165, 225, 165,
                 Color(0, 100, 40));
@@ -1021,6 +1161,12 @@ display:
           it.print(120, 205, id(terminal_font),
                    Color(255, 160, 0),
                    TextAlign::TOP_CENTER, "SCANNER OFF");
+        } else {
+          it.printf(120, 205, id(terminal_font),
+                    trk_alert ? Color(255, 160, 0) : Color(0, 180, 70),
+                    TextAlign::TOP_CENTER,
+                    trk_alert ? "! TRACKER: %d !" : "TRACKER: %d",
+                    id(tracker_count));
         }
       }
 
