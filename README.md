@@ -2,19 +2,20 @@
 <img width="920" height="945" alt="image" src="https://github.com/user-attachments/assets/46394f3d-b300-46db-aedd-f6e7f2244ef0" />
 
 
-ESPHome firmware for a small ESP32 display device (**NM-TV**): a 240x240 ST7789 screen with one touch button, showing a clock, system status, a BLE device counter, a free-form info card and a light page. Everything is controlled from Home Assistant or the built-in web UI.
+ESPHome firmware for a small ESP32 display device (**NM-TV**): a 240x240 ST7789 screen with one touch button, showing a clock, system status, a BLE device counter with tracker detection, a free-form info card and a light page. Everything is controlled from Home Assistant or the built-in web UI.
 
 One YAML file, no custom C++ components.
 
 ## Features
 
 - **6 display pages** in neon green: Welcome, System status, Card, Clock, BLE scanner, Light
-- **Touch button**: short tap = next page, hold = push button of the current page (`PushLight` on the light page)
+- **Touch button**: short tap = next page, hold = action of the current page (`PushLight` on the light page, dimmer toggle on the clock page)
 - **Spike filter** for the touch input (`touch_delay`), so a piezo lighter or similar noise does not switch pages
 - **Auto page rotation**: choose pages and interval at runtime
-- **Clock page** with English/German switch (`ClockLanguage`), NTP time
+- **Clock page** with English/German switch (`ClockLanguage`), NTP time, hold to toggle the dimmer between 30 % and 100 %
 - **Card page**: send a JSON to the `Card` text entity and it shows title and up to 8 lines in 4 sizes
 - **BLE scanner** counting nearby devices (current and peak), can be switched on and off
+- **Tracker detection**: spots AirTag / Find My, Samsung SmartTag, Tile, Chipolo and Google Find My Device trackers and raises an alert when one stays around
 - **Web UI** (v3) with groups, plus OTA, safe mode and encrypted API
 - Brightness, rotate interval and more as runtime entities, no reflash needed
 
@@ -42,9 +43,22 @@ One YAML file, no custom C++ components.
    webgui_password: "..."
    ```
 
-3. Adjust the `substitutions` at the top (`device_name`, `localdomain`, `touch_delay`, `long_press_ms`).
+3. Adjust the `substitutions` at the top, see [Substitutions](#substitutions).
 4. Flash it. The first flash must be over USB, later updates via OTA.
 5. Add the device in Home Assistant (ESPHome integration).
+
+## Substitutions
+
+| Name | Default | Meaning |
+|---|---|---|
+| `device_name`, `friendly_name`, `localdomain` | | Device naming and local domain |
+| `touch_delay` | `80ms` | Touch must be active this long to count |
+| `long_press_ms` | `600` | Hold time in ms |
+| `dim_low`, `dim_high` | `30`, `100` | Backlight levels (%) toggled by holding on the clock page |
+| `ble_interval`, `ble_window` | `160ms`, `120ms` | BLE scan timing, the window must be smaller than the interval so WiFi keeps some airtime |
+| `ble_timeout_s` | `45` | A device counts as present this many seconds after its last advertisement |
+| `tracker_timeout_s` | `60` | A tracker is forgotten after this many seconds without advertisement |
+| `tracker_alert_min` | `5` | Alert when a tracker was present this many minutes |
 
 ## Pages
 
@@ -54,7 +68,7 @@ One YAML file, no custom C++ components.
 | 2 | Status | Host, IP, SSID, signal, MAC, uptime, free heap, ESPHome version, build date, BLE count |
 | 3 | Card | Content you send to the `Card` entity (only shown once something was sent) |
 | 4 | Clock | Weekday, time and date |
-| 5 | BLE | Number of BLE devices around, with peak |
+| 5 | BLE | Number of BLE devices around, peak and tracker count (frame turns orange on alert) |
 | 6 | Light | Static light page, `PushLight` is active while you hold the touch |
 
 Pages can be changed with the `DisplayPage` select. `RotatePages` takes a list like `3,4` or `1-4` or `1,3-6`, `RotateInterval` sets the time.
@@ -62,8 +76,38 @@ Pages can be changed with the `DisplayPage` select. `RotatePages` takes a list l
 ## Touch
 
 - **Short tap** (on release): next page
-- **Hold** (`long_press_ms`, default 600 ms): the push button of the current page goes active until you release. Currently only the light page has one (`PushLight`), use it as a trigger in Home Assistant.
+- **Hold** (`long_press_ms`, default 600 ms), depends on the page:
+  - Clock page: toggles the backlight between `dim_low` and `dim_high`. It goes through the `Brightness` entity, so the slider follows and the value is stored.
+  - Light page: `PushLight` goes active until you release, use it as a trigger in Home Assistant.
+  - Other pages: nothing, the hold does not change the page.
 - `touch_delay` (default 80 ms): the touch must be active at least this long. Raise it if short noise spikes still switch pages.
+
+## BLE scanner
+
+The counter shows every address that advertised within the last `ble_timeout_s` seconds, plus the peak since boot (`ResetBLEPeak` resets it).
+
+The count always moves a bit, because many phones and wearables rotate their random MAC address. A longer `ble_timeout_s` calms the number, a shorter one reacts faster.
+
+## Tracker detection
+
+Trackers are recognized by their advertisement signature, passive scanning is enough:
+
+| Type | Signature |
+|---|---|
+| Apple Find My (AirTag and other Find My accessories) | Manufacturer data 0x004C, type 0x12, length 0x19 |
+| Samsung SmartTag | Service data 0xFD5A |
+| Tile | Service data / UUID 0xFEED or 0xFD84 |
+| Chipolo | Service data 0xFE65 |
+| Google Find My Device network | Service data 0xFEAA with frame type 0x40 or 0x41 |
+
+Every tracker is followed per address. If it keeps advertising without a gap longer than `tracker_timeout_s`, its presence time grows. Once a tracker has been around for `tracker_alert_min` minutes, the alert is raised, the BLE page shows `! TRACKER: n !` with an orange frame, and `TrackerAlert` turns on in Home Assistant.
+
+Limits:
+
+- An AirTag in separated mode rotates its address about every 15 minutes, so keep `tracker_alert_min` well below that.
+- Other Find My accessories (for example separated AirPods) look the same as an AirTag and can cause false alerts.
+- The device is stationary, so this tells you "a tracker is parked near me", not "a tracker follows me".
+- The UUIDs for Tile and Chipolo may need adjusting if a tracker is not detected.
 
 ## Card
 
@@ -103,15 +147,18 @@ data:
 | `DisplayPage` | select | Jump to a page |
 | `ClockLanguage` | select | English / German on the clock page |
 | `RotatePages`, `RotateInterval` | text, number | Auto rotation |
-| `Brightness` | number | Backlight |
+| `Brightness` | number | Backlight, also toggled by holding on the clock page |
 | `BLEScanner` | switch | BLE scan on/off |
 | `BLEDevices`, `BLEPeak` | sensor | BLE counter, `ResetBLEPeak` resets the peak |
+| `TrackerAlert` | binary sensor | On when a tracker was present longer than `tracker_alert_min` |
+| `TrackerCount` | sensor | Trackers currently in range |
+| `TrackerInfo` | text sensor | Type and presence time per tracker, e.g. `FindMy 6:12, Tile 0:40` |
 | `WiFiSignal`, `HeapFree`, `NM TV Uptime`, ... | sensors | Diagnostics |
 | `ResetReason`, `DeviceInfo` | text sensors | Boot info |
 
 ## Known issue: resets from sparks
 
-A piezo lighter or gas stove igniter close to the device can reset the whole chip. This is an electrical issue (the touch wire acts as an antenna, or noise gets in through the power supply) and cannot be fixed in software. Things that can help but this is only an AI-Dream and not tested by myself:
+A piezo lighter or gas stove igniter close to the device can reset the whole chip. This is an electrical issue (the touch wire acts as an antenna, or noise gets in through the power supply) and cannot be fixed in software. Things that help:
 
 - Short touch wire, with a 470 Ω to 1 kΩ series resistor near the pin
 - 100 nF at EN and 3V3, plus a bulk capacitor (470 µF or more) at 5 V
