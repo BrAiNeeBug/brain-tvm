@@ -111,7 +111,7 @@ data:
 
 ## Known issue: resets from sparks
 
-A piezo lighter or gas stove igniter close to the device can reset the whole chip. This is an electrical issue (the touch wire acts as an antenna, or noise gets in through the power supply) and cannot be fixed in software. Things that help:
+A piezo lighter or gas stove igniter close to the device can reset the whole chip. This is an electrical issue (the touch wire acts as an antenna, or noise gets in through the power supply) and cannot be fixed in software. Things that can help but this is only an AI-Dream and not tested by myself:
 
 - Short touch wire, with a 470 Ω to 1 kΩ series resistor near the pin
 - 100 nF at EN and 3V3, plus a bulk capacitor (470 µF or more) at 5 V
