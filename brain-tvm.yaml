@@ -1,18 +1,24 @@
 #giturl: "https://github.com/BrAiNeeBug"
 substitutions:
-  device_name: brain-tvm1
+  # Values are pasted as plain text. Everything is quoted for consistency.
+  # Options that expect a time need the unit ("80ms"); values used inside C++ lambdas
+  # (*_ms, *_s, *_min, dim_*) are bare numbers, the unit is in the name.
+  device_name: "brain-tvm1"
   friendly_name: "brain-tvm1"
   localdomain: ".bk-net"
   # Touch must be active this long to count (filters spikes, e.g. from a piezo lighter)
-  touch_delay: 80ms
+  touch_delay: "50ms"
+  # Touch trigger level: touched when the raw value drops below this (differs per device/wiring)
+  touch_threshold: "1450"
+  # "true" = log the raw touch values (idle vs touched) to find the right threshold, then back to "false"
+  touch_setup_mode: "false"
   # Hold time in ms for the page button (short tap = next page)
   long_press_ms: "600"
-  # Hold on the clock page toggles the backlight between these two levels (%)
-  dim_low: "30"
-  dim_high: "100"
+  # Hold on the clock page toggles the backlight between this level (%) and the previous brightness
+  dim_low: "5"
   # BLE scan timing (window must be smaller than interval, WiFi needs the rest)
-  ble_interval: 160ms
-  ble_window: 120ms
+  ble_interval: "160ms"
+  ble_window: "120ms"
   # A device counts as "present" this long after its last advertisement
   ble_timeout_s: "45"
   # Trackers: forget after this many seconds without advert / alert after this many minutes of presence
@@ -104,6 +110,8 @@ web_server:
       name: "System"
       sorting_weight: 40
   ota: false
+  # Show entities marked 'internal: true' in the web UI (they are hidden from API/HA)
+  include_internal: true
 
 # NTP time sync
 time:
@@ -258,11 +266,17 @@ output:
 
 # Touch button
 esp32_touch:
-  setup_mode: false
+  setup_mode: ${touch_setup_mode}
 
 # Current page and card content
 # Pages: 0 = welcome, 1 = system status, 2 = card, 3 = clock, 4 = BLE scanner, 5 = light
 globals:
+  # Brightness (%) before the clock dimmer was activated, restored on the next hold
+  - id: dim_prev
+    type: float
+    restore_value: true
+    initial_value: "50"
+
   - id: screen_page
     type: int
     restore_value: false
@@ -358,6 +372,12 @@ font:
     id: clock_font
     size: 40
 
+  # Big clock digits (HH:MM) - only the glyphs needed, saves RAM
+  - file: "gfonts://Roboto Mono"
+    id: clock_big_font
+    size: 72
+    glyphs: "0123456789:"
+
 #############################################
 ##########  Entities / Web UI  ##############
 #############################################
@@ -366,9 +386,9 @@ binary_sensor:
   # Short tap = next page (on release), hold = push button of the current page
   - platform: esp32_touch
     pin: GPIO32
-    name: "NM TV Touch"
+    name: "Touch"
     id: touch_button
-    threshold: 1450
+    threshold: ${touch_threshold}
     filters:
       - delayed_on: ${touch_delay}
     web_server:
@@ -414,11 +434,11 @@ binary_sensor:
 switch:
   - platform: template
     name: "BLEScanner"
+    entity_category: config
     id: ble_scan_switch
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     icon: "mdi:bluetooth-audio"
-    entity_category: config
     web_server:
       sorting_group_id: grp_ble
       sorting_weight: 1
@@ -479,7 +499,6 @@ select:
       - "German"
     initial_option: "English"
     icon: "mdi:translate"
-    entity_category: config
     web_server:
       sorting_group_id: grp_display
       sorting_weight: 3
@@ -490,7 +509,7 @@ number:
     id: backlight_pct
     optimistic: true
     restore_value: true
-    initial_value: 100
+    initial_value: 50
     min_value: 0
     max_value: 100
     step: 1
@@ -518,10 +537,26 @@ number:
     mode: SLIDER
     unit_of_measurement: "s"
     icon: "mdi:timer-sand"
-    entity_category: config
     web_server:
       sorting_group_id: grp_display
       sorting_weight: 4
+
+  # Shifts the hue of the clock's day progress bar (0 = default: green/blue/purple by day, dark red by night)
+  - platform: template
+    name: "ClockBarHue"
+    id: clock_bar_hue
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 360
+    step: 5
+    mode: SLIDER
+    unit_of_measurement: "°"
+    icon: "mdi:palette"
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 5
 
 text:
   # Card for the card page: send the JSON as text (Web UI field or HA action text.set_value).
@@ -570,7 +605,6 @@ text:
     min_length: 0
     max_length: 16
     icon: "mdi:format-list-numbered"
-    entity_category: config
     web_server:
       sorting_group_id: grp_display
       sorting_weight: 5
@@ -586,11 +620,17 @@ button:
       sorting_group_id: grp_system
       sorting_weight: 2
 
-  # Real safe mode restart, hidden. Used by the SafeModeRestart button below.
+  # Real safe mode restart. Used by the SafeModeRestart button below (which shows the notice first).
+  # Internal = hidden from HA, but web_server include_internal shows it in the web UI,
+  # so it is named clearly and sorted to the end of the System group.
+  # Press "SafeModeRestart" instead: this one reboots without the display notice.
   - platform: safe_mode
-    name: "SafeModeRestartInternal"
+    name: "SafeModeRestartRaw_NoNotice"
     id: safe_mode_btn
     internal: true
+    web_server:
+      sorting_group_id: grp_system
+      sorting_weight: 99
 
   # Shows a BOOTMODE notice first, because the display freezes in safe mode
   - platform: template
@@ -610,8 +650,8 @@ button:
 
   - platform: template
     name: "ResetBLEPeak"
-    icon: "mdi:counter"
     entity_category: config
+    icon: "mdi:counter"
     on_press:
       - lambda: |-
           id(ble_peak) = id(ble_count);
@@ -626,10 +666,44 @@ sensor:
     update_interval: 15s
     entity_category: diagnostic
     icon: "mdi:wifi-strength-2"
-    disabled_by_default: true
     web_server:
       sorting_group_id: grp_network
       sorting_weight: 4
+
+  # Signal quality in % derived from the RSSI (-100 dBm = 0 %, -50 dBm = 100 %)
+  - platform: template
+    name: "WiFiQuality"
+    id: wifi_quality
+    update_interval: 15s
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    icon: "mdi:wifi-check"
+    lambda: |-
+      float rssi = id(wifi_signal_rssi).state;
+      if (std::isnan(rssi))
+        return NAN;
+      float q = 2.0f * (rssi + 100.0f);
+      if (q < 0.0f) q = 0.0f;
+      if (q > 100.0f) q = 100.0f;
+      return q;
+    web_server:
+      sorting_group_id: grp_network
+      sorting_weight: 6
+
+  - platform: template
+    name: "WiFiChannel"
+    id: wifi_channel
+    update_interval: 30s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: "mdi:sine-wave"
+    lambda: |-
+      return wifi::global_wifi_component->get_wifi_channel();
+    web_server:
+      sorting_group_id: grp_network
+      sorting_weight: 7
 
   - platform: template
     name: "BLEDevices"
@@ -672,24 +746,28 @@ sensor:
   - platform: debug
     free:
       name: "HeapFree"
+      internal: true
       entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
         sorting_weight: 10
     block:
       name: "HeapMaxBlock"
+      internal: true
       entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
         sorting_weight: 11
     loop_time:
       name: "LoopTime"
+      internal: true
       entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
         sorting_weight: 12
     cpu_frequency:
       name: "CPUFreq"
+      internal: true
       entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
@@ -698,7 +776,8 @@ sensor:
 text_sensor:
   - platform: wifi_info
     ip_address:
-      name: "NM TV IP"
+      name: "IP"
+      entity_category: diagnostic
       id: wifi_ip
       web_server:
         sorting_group_id: grp_network
@@ -723,6 +802,12 @@ text_sensor:
       web_server:
         sorting_group_id: grp_network
         sorting_weight: 5
+    dns_address:
+      name: "WiFiDNS"
+      entity_category: diagnostic
+      web_server:
+        sorting_group_id: grp_network
+        sorting_weight: 8
 
   # Which trackers are around and for how long (m:ss)
   - platform: template
@@ -754,7 +839,8 @@ text_sensor:
       return out;
 
   - platform: template
-    name: "NM TV Uptime"
+    name: "Uptime"
+    entity_category: diagnostic
     id: uptime_text
     update_interval: 10s
     web_server:
@@ -773,6 +859,7 @@ text_sensor:
 
   - platform: template
     name: "SystemTime"
+    internal: true
     id: system_time_text
     update_interval: 5s
     icon: "mdi:clock-outline"
@@ -788,11 +875,13 @@ text_sensor:
   - platform: debug
     device:
       name: "DeviceInfo"
+      entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
         sorting_weight: 20
     reset_reason:
       name: "ResetReason"
+      entity_category: diagnostic
       web_server:
         sorting_group_id: grp_system
         sorting_weight: 21
@@ -827,6 +916,19 @@ interval:
           if (id(ble_count) > id(ble_peak))
             id(ble_peak) = id(ble_count);
 
+  # Display refresh: fast on the clock page (comet ring, colon fade), relaxed elsewhere
+  # so the main loop stays free for touch + BLE
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static uint32_t last = 0;
+          uint32_t now = millis();
+          uint32_t period = (id(screen_page) == 3) ? 250 : 500;
+          if (now - last >= period) {
+            last = now;
+            id(main_display).update();
+          }
+
   # Hold detection: after long_press_ms the page button of the current page goes active
   # (clock page: toggles the dimmer instead)
   - interval: 50ms
@@ -841,8 +943,17 @@ interval:
           if (id(screen_page) == 5)
             id(push_light).publish_state(true);
           if (id(screen_page) == 3) {
+            // dimmed -> back to the brightness from before, otherwise remember it and dim
+            float cur = id(backlight_pct).state;
+            float target;
+            if (cur > ${dim_low}) {
+              id(dim_prev) = cur;
+              target = ${dim_low};
+            } else {
+              target = id(dim_prev) > ${dim_low} ? id(dim_prev) : 50.0f;
+            }
             auto call = id(backlight_pct).make_call();
-            call.set_value(id(backlight_pct).state > (${dim_low} + ${dim_high}) / 2.0f ? ${dim_low} : ${dim_high});
+            call.set_value(target);
             call.perform();
           }
 
@@ -907,7 +1018,8 @@ display:
       offset_width: 0
       offset_height: 0
     rotation: 0
-    update_interval: 500ms
+    data_rate: 40MHz  # default is 10 MHz; if the picture glitches try 20MHz
+    update_interval: never  # refresh is triggered by the interval below (clock page faster)
     lambda: |-
       it.fill(Color(0, 0, 0));
 
@@ -971,7 +1083,7 @@ display:
 
         it.print(120, 80, id(terminal_font),
                  Color(0, 180, 70),
-                 TextAlign::TOP_CENTER, "NM-TV // HA DASHBOARD");
+                 TextAlign::TOP_CENTER, "HA DASHBOARD");
 
         it.line(15, 105, 225, 105,
                 Color(0, 100, 40));
@@ -994,6 +1106,20 @@ display:
                 Color(0, 120, 50));
 
         auto row = [&](int y, const char *label, std::string value) {
+          // The font has no glyphs for non-ASCII characters (e.g. emoji in the SSID) and the
+          // missing codepoint would spam the log: replace each multi-byte character with "_"
+          std::string clean;
+          for (size_t i = 0; i < value.size(); i++) {
+            unsigned char ch = value[i];
+            if (ch < 0x80) {
+              clean += (char) ch;
+            } else {
+              clean += '_';
+              while (i + 1 < value.size() && ((unsigned char) value[i + 1] & 0xC0) == 0x80)
+                i++;
+            }
+          }
+          value = clean;
           if (value.length() > 18)
             value.resize(18);
           it.print(8, y, id(terminal_font),
@@ -1086,40 +1212,122 @@ display:
       // PAGE 3: CLOCK (language from the ClockLanguage select)
       else if (id(screen_page) == 3) {
         bool de = id(clock_lang).active_index().value_or(0) == 1;
-
-        it.rectangle(4, 4, 232, 232,
-                     Color(0, 180, 70));
-
-        it.filled_rectangle(5, 5, 230, 28,
-                            Color(0, 65, 30));
-
-        it.print(10, 11, id(terminal_font),
-                 Color(0, 255, 90), de ? "UHR" : "CLOCK");
-
         auto now = id(sntp_time).now();
 
         if (now.is_valid()) {
-          // Weekday
+          // ---------- helpers ----------
+          auto mix = [](Color a, Color b, float t) -> Color {
+            return Color((uint8_t) (a.r + (b.r - a.r) * t),
+                         (uint8_t) (a.g + (b.g - a.g) * t),
+                         (uint8_t) (a.b + (b.b - a.b) * t));
+          };
+          auto dim = [](Color c, float f) -> Color {
+            return Color((uint8_t) (c.r * f), (uint8_t) (c.g * f), (uint8_t) (c.b * f));
+          };
+          // rainbow: hue 0..360 -> full-saturation color
+          auto hue = [](float h) -> Color {
+            float x = fmodf(h, 360.0f) / 60.0f;
+            int i = (int) x;
+            float f = x - i;
+            uint8_t up = (uint8_t) (255 * f);
+            uint8_t down = (uint8_t) (255 * (1.0f - f));
+            switch (i) {
+              case 0: return Color(255, up, 0);
+              case 1: return Color(down, 255, 0);
+              case 2: return Color(0, 255, up);
+              case 3: return Color(0, down, 255);
+              case 4: return Color(up, 0, 255);
+              default: return Color(255, 0, down);
+            }
+          };
+          float hf = now.hour + now.minute / 60.0f + now.second / 3600.0f;
+
+          // ---------- shared palette for digits + day bar ----------
+          // u = 0..1; day: green -> blue -> purple, night: dark red; ClockBarHue slider shifts the hue
+          float hoff = id(clock_bar_hue).state;
+          float night;  // 0 = day, 1 = night, smooth fade 20-22 h and 5-7 h
+          if (hf < 5.0f) night = 1.0f;
+          else if (hf < 7.0f) night = 1.0f - (hf - 5.0f) / 2.0f;
+          else if (hf < 20.0f) night = 0.0f;
+          else if (hf < 22.0f) night = (hf - 20.0f) / 2.0f;
+          else night = 1.0f;
+          auto palette = [&](float u) -> Color {
+            Color dayc = hue(140.0f + 150.0f * u + hoff);
+            Color nightc = dim(hue(345.0f + 35.0f * u + hoff), 0.45f);
+            return mix(dayc, nightc, night);
+          };
+
+          // ---------- seconds ring: rainbow dots, bright comet follows the current second ----------
+          const float rm = 6.0f, rl = 228.0f;
+          for (int i = 0; i < 60; i++) {
+            float s = fmodf(0.5f + i / 15.0f, 4.0f);  // 0 s = top center, clockwise
+            int side = (int) s;
+            float f = s - side;
+            float px, py;
+            switch (side) {
+              case 0: px = rm + f * rl; py = rm; break;
+              case 1: px = rm + rl; py = rm + f * rl; break;
+              case 2: px = rm + rl - f * rl; py = rm + rl; break;
+              default: px = rm; py = rm + rl - f * rl; break;
+            }
+            int d = (now.second - i + 60) % 60;  // seconds behind the comet head
+            Color c = hue(i * 6.0f);
+            if (d == 0) {
+              it.filled_rectangle((int) px - 5, (int) py - 5, 10, 10, Color(255, 255, 255));
+            } else if (d < 15) {
+              it.filled_rectangle((int) px - 3, (int) py - 3, 6, 6, dim(c, 1.0f - d / 15.0f * 0.75f));
+            } else {
+              it.filled_rectangle((int) px - 3, (int) py - 3, 6, 6, dim(c, 0.12f));
+            }
+          }
+
+          // ---------- weekday (own color per day) ----------
           static const char *weekdays_de[] = {"", "Sonntag", "Montag", "Dienstag", "Mittwoch",
                                               "Donnerstag", "Freitag", "Samstag"};
           static const char *weekdays_en[] = {"", "Sunday", "Monday", "Tuesday", "Wednesday",
                                               "Thursday", "Friday", "Saturday"};
-          it.printf(120, 62, id(value_font),
-                    Color(0, 200, 90),
+          static const uint8_t wr[] = {0, 255, 255, 255, 255, 80, 60, 170};
+          static const uint8_t wg[] = {0, 70, 80, 160, 230, 255, 200, 110};
+          static const uint8_t wb[] = {0, 200, 80, 40, 60, 120, 255, 255};
+          int wd = now.day_of_week;
+          it.printf(120, 36, id(value_font),
+                    Color(wr[wd], wg[wd], wb[wd]),
                     TextAlign::TOP_CENTER, "%s",
-                    de ? weekdays_de[now.day_of_week] : weekdays_en[now.day_of_week]);
+                    de ? weekdays_de[wd] : weekdays_en[wd]);
 
-          // Time
-          it.strftime(120, 105, id(clock_font),
-                      Color(0, 255, 90),
-                      TextAlign::TOP_CENTER, "%H:%M:%S", now);
+          // ---------- time: vertical gradient from the shared palette ----------
+          float ut = hf / 24.0f * 0.8f;  // position in the palette moves with the time of day
+          Color top = palette(ut);
+          Color bot = palette(ut + 0.2f);
+          const int cw = 43;  // char width of the 72px mono font
+          float ph = (millis() % 2000) / 2000.0f;
+          float br = 0.15f + 0.85f * (0.5f - 0.5f * cosf(2.0f * M_PI * ph));  // colon fade 0.15 .. 1.0
+          const int bands = 12, y0 = 72, bh = 8;
+          for (int k = 0; k < bands; k++) {
+            Color c = mix(top, bot, k / (float) (bands - 1));
+            it.start_clipping(0, y0 + k * bh, 239, y0 + (k + 1) * bh - 1);
+            it.strftime(120 - cw / 2, y0, id(clock_big_font), c,
+                        TextAlign::TOP_RIGHT, "%H", now);
+            it.print(120, y0, id(clock_big_font), dim(c, br),
+                     TextAlign::TOP_CENTER, ":");
+            it.strftime(120 + cw / 2, y0, id(clock_big_font), c,
+                        TextAlign::TOP_LEFT, "%M", now);
+            it.end_clipping();
+          }
 
-          it.line(15, 165, 225, 165,
-                  Color(0, 100, 40));
+          // ---------- day progress bar (0-24 h) ----------
+          const int bx = 22, bw = 98;  // 98 columns x 2 px
+          int cur = (int) (hf / 24.0f * bw);
+          for (int c = 0; c < bw; c++) {
+            Color col = palette(c / (float) (bw - 1));
+            it.filled_rectangle(bx + c * 2, 171, 2, 6, c <= cur ? col : dim(col, 0.15f));
+          }
+          it.filled_rectangle(bx + cur * 2 - 1, 168, 4, 12,
+                              dim(Color(255, 255, 255), 1.0f - 0.6f * night));
 
-          // Date
-          it.strftime(120, 180, id(terminal_font),
-                      Color(0, 255, 90),
+          // ---------- date ----------
+          it.strftime(120, 186, id(value_font),
+                      Color(210, 215, 235),
                       TextAlign::TOP_CENTER, de ? "%d.%m.%Y" : "%b %d, %Y", now);
         } else {
           it.print(12, 75, id(terminal_font),
