@@ -30,6 +30,8 @@ substitutions:
   page_count: "10"
   # Weather page: default PLZ (change it at runtime with the WeatherPLZ text entity) and country code
   weather_plz_default: "10115"
+  # Weather page: you can also use you state/town name
+  # weather_plz_default: "Berlin"
   weather_country: "DE"
   # Tea timer page (touch): hold = +step, longer hold = start/pause, longest hold = reset
   timer_step_s: "30"

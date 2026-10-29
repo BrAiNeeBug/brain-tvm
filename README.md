@@ -1,9 +1,8 @@
-# brain-tvm "Fully ENG/DE Translated OSD"
+# brain-tvm
 
 ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card, a WiFi monitor with QR code, weather, the moon phase and a tea timer. Everything is controlled from Home Assistant or the built-in web UI.
 
 One YAML file, no custom C++ components.
-<img width="2087" height="2887" alt="image" src="https://github.com/user-attachments/assets/ae8df9e7-5333-4bab-bb60-e013203072ba" />
 
 ## Features
 
@@ -68,13 +67,14 @@ All values are plain text that gets pasted into the config, so they are all quot
 | `touch_threshold` | `1450` | Touch trigger level, the pad counts as touched when its raw value drops below this |
 | `touch_setup_mode` | `false` | `true` logs the raw touch values, see [Touch](#touch) |
 | `long_press_ms` | `600` | Hold time in ms |
+| `date_bright_pct` | `50` | Brightness (%) of weekday and date on the clock page, the time digits are always at full brightness |
 | `dim_low` | `5` | Backlight level (%) the clock page dimmer goes down to, at or below this level night mode is active |
 | `ble_interval`, `ble_window` | `160ms`, `120ms` | BLE scan timing, the window must be smaller than the interval so WiFi keeps some airtime |
 | `ble_timeout_s` | `45` | A device counts as present this many seconds after its last advertisement |
 | `tracker_timeout_s` | `60` | A tracker is forgotten after this many seconds without advertisement |
 | `tracker_alert_min` | `5` | Alert when a tracker was present this many minutes |
 | `page_count` | `10` | Number of display pages |
-| `weather_plz_default` | `10115` | Default location of the weather page, change it at runtime with `WeatherPLZ` |
+| `weather_plz_default` | `10115` | Default location of the weather page, a PLZ or a state / town name (e.g. `"Berlin"`), change it at runtime with `WeatherPLZ` |
 | `weather_country` | `DE` | Country code used when a PLZ or city name is geocoded |
 | `timer_step_s` | `30` | Tea timer: seconds added per hold |
 | `timer_max_min` | `15` | Tea timer: longest time you can set |
@@ -119,11 +119,11 @@ The `Language` select switches all display pages between English and German. Ger
 
 - **Seconds ring**: 60 rainbow dots around the edge, 0 s is at the top center and it runs clockwise. The current second is a white dot with a fading tail of 15 dots.
 - **Time (HH:MM, no seconds)**: the digits have a vertical color gradient. The colon fades between bright and dark in a 2 second cycle.
-- **Weekday**: its own color per day (Monday red, Tuesday orange, Wednesday yellow, Thursday green, Friday cyan, Saturday purple, Sunday pink), in English or German.
+- **Weekday**: its own color per day (Monday red, Tuesday orange, Wednesday yellow, Thursday green, Friday cyan, Saturday purple, Sunday pink), in English or German. Weekday and date are drawn at `date_bright_pct` (50 %) so the time stands out.
 - **Day progress bar**: 0-24 h, filled up to the current time, with a white marker.
 - **Date**: `dd.mm.yyyy` in German, `Mon dd, yyyy` in English.
 
-**Colors**: digits and bar use the same palette. By day it runs from green over blue to purple. At night it is a dimmed dark red. The change fades in from 20 h to 22 h and out from 5 h to 7 h, so it is easy on the eyes at the bedside. The `ClockBarHue` slider (0-360°) shifts the hue of both palettes, day and night.
+**Colors**: digits and bar use the same palette. By day it runs from green over blue to purple. At night it is dark red, the digits at full brightness so the time stays readable when the backlight is dimmed, the bar a bit dimmer. The change fades in from 20 h to 22 h and out from 5 h to 7 h, so it is easy on the eyes at the bedside. The `ClockBarHue` slider (0-360°) shifts the hue of both palettes, day and night.
 
 **Dimmer**: hold on the clock page to dim the backlight down to `dim_low` (default 5 %). Hold again to go back to the brightness from before. That previous brightness is stored, so it survives a reboot. It goes through the `Brightness` entity, so the slider follows. Without a stored value it returns to 50 %. While dimmed, [night mode](#night-mode) is active.
 
@@ -222,7 +222,14 @@ Hold the touch to show a QR code that lets a phone join the network (content fro
 
 The page shows indoor and outdoor temperature, the current conditions with an icon, today's high and low and the next 3 days. Data comes from [Open-Meteo](https://open-meteo.com) over HTTPS, no API key needed. It refreshes every 15 minutes and after the time sync.
 
-- **Location**: the `WeatherPLZ` text entity takes a PLZ, a city name (`Berlin`) or coordinates (`52.53,13.60`). PLZ and city are geocoded via Open-Meteo (restricted to `weather_country`), coordinates are used directly. The default is `weather_plz_default`.
+- **Location**: the `WeatherPLZ` text entity takes a PLZ, a city name (`Berlin`) or coordinates (`52.53,13.60`). PLZ and city are geocoded via Open-Meteo (restricted to `weather_country`), coordinates are used directly. The default is `weather_plz_default`, which takes the same values:
+
+```yaml
+substitutions:
+  weather_plz_default: "10115"
+  # or a state / town name:
+  # weather_plz_default: "Berlin"
+```
 - **Indoor / outdoor**: send them from Home Assistant to the `TempIndoor` and `TempOutdoor` numbers. A value counts for `temp_timeout_min` minutes. After that indoor shows `--`, and outdoor falls back to the temperature from the weather service.
 
 ```yaml
