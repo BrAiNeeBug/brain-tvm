@@ -16,6 +16,8 @@ substitutions:
   long_press_ms: "600"
   # Hold on the clock page toggles the backlight between this level (%) and the previous brightness
   dim_low: "5"
+  # Clock page: weekday + date brightness (%) relative to the time digits (digits are always full brightness)
+  date_bright_pct: "50"
   # BLE scan timing (window must be smaller than interval, WiFi needs the rest)
   ble_interval: "160ms"
   ble_window: "120ms"
@@ -1679,9 +1681,10 @@ display:
           else if (hf < 20.0f) night = 0.0f;
           else if (hf < 22.0f) night = (hf - 20.0f) / 2.0f;
           else night = 1.0f;
-          auto palette = [&](float u) -> Color {
+          // nb = brightness of the night palette: digits full (readable at night), bar dimmed
+          auto palette = [&](float u, float nb) -> Color {
             Color dayc = hue(140.0f + 150.0f * u + hoff);
-            Color nightc = dim(hue(345.0f + 35.0f * u + hoff), 0.45f);
+            Color nightc = dim(hue(345.0f + 35.0f * u + hoff), nb);
             return mix(dayc, nightc, night);
           };
 
@@ -1718,7 +1721,8 @@ display:
           static const uint8_t wg[] = {0, 70, 80, 160, 230, 255, 200, 110};
           static const uint8_t wb[] = {0, 200, 80, 40, 60, 120, 255, 255};
           int wd = now.day_of_week;
-          Color day_col = Color(wr[wd], wg[wd], wb[wd]);
+          // weekday + date are dimmer than the time so the digits stand out (also at night)
+          Color day_col = dim(Color(wr[wd], wg[wd], wb[wd]), ${date_bright_pct} / 100.0f);
           it.printf(120, 36, id(value_font),
                     day_col,
                     TextAlign::TOP_CENTER, "%s",
@@ -1726,8 +1730,8 @@ display:
 
           // ---------- time: vertical gradient from the shared palette ----------
           float ut = hf / 24.0f * 0.8f;  // position in the palette moves with the time of day
-          Color top = palette(ut);
-          Color bot = palette(ut + 0.2f);
+          Color top = palette(ut, 1.0f);
+          Color bot = palette(ut + 0.2f, 1.0f);
           const int cw = 43;  // char width of the 72px mono font
           float ph = (millis() % 2000) / 2000.0f;
           float br = 0.15f + 0.85f * (0.5f - 0.5f * cosf(2.0f * M_PI * ph));  // colon fade 0.15 .. 1.0
@@ -1748,7 +1752,7 @@ display:
           const int bx = 22, bw = 98;  // 98 columns x 2 px
           int cur = (int) (hf / 24.0f * bw);
           for (int c = 0; c < bw; c++) {
-            Color col = palette(c / (float) (bw - 1));
+            Color col = palette(c / (float) (bw - 1), 0.45f);
             it.filled_rectangle(bx + c * 2, 171, 2, 6, c <= cur ? col : dim(col, 0.15f));
           }
           it.filled_rectangle(bx + cur * 2 - 1, 168, 4, 12,
