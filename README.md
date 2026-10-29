@@ -1,4 +1,4 @@
-# brain-tvm
+# brain-tvm "Fully ENG/DE Translated OSD"
 
 ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card, a WiFi monitor with QR code, weather, the moon phase and a tea timer. Everything is controlled from Home Assistant or the built-in web UI.
 
