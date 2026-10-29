@@ -3,6 +3,7 @@
 ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card, a WiFi monitor with QR code, weather, the moon phase and a tea timer. Everything is controlled from Home Assistant or the built-in web UI.
 
 One YAML file, no custom C++ components.
+<img width="2087" height="2887" alt="image" src="https://github.com/user-attachments/assets/ae8df9e7-5333-4bab-bb60-e013203072ba" />
 
 ## Features
 
