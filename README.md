@@ -1,21 +1,24 @@
 # brain-tvm
-<img width="720" height="622" alt="image" src="https://github.com/user-attachments/assets/bf93e311-9ff8-41b3-bc3e-bd3a893a51cb" />
 
-ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card and a light page. Everything is controlled from Home Assistant or the built-in web UI.
+ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card, a WiFi monitor with QR code, weather, the moon phase and a tea timer. Everything is controlled from Home Assistant or the built-in web UI.
 
 One YAML file, no custom C++ components.
 
 ## Features
 
-- **6 display pages** (neon green theme, the clock page is in color): Welcome, System status, Card, Clock, BLE scanner, Light
+- **10 display pages** (neon green theme, the clock page is in color): Welcome, Status, Card, Clock, BLE scanner, Light, WiFi monitor, Weather, Moon phase, Tea timer
 - **Colorful clock**: rainbow seconds ring, gradient digits with a fading colon, weekday in its own color and a day progress bar. Digits and bar share a palette (green/blue/purple by day, dark red by night) that you can shift with the `ClockBarHue` slider
-- **Touch button**: short tap = next page, hold = action of the current page (`PushLight` on the light page, dimmer toggle on the clock page)
+- **Touch button**: short tap = next page, hold = action of the current page (dimmer on the clock page, `PushLight` on the light page, QR code on the WiFi page, timer control on the tea timer page)
+- **Night mode**: dim the clock page and the device shows only the clock, whatever else is set
+- **Page selection at runtime**: `EnabledPages` decides which pages can be reached at all (touch and rotation), `RotatePages` which ones take part in the auto rotation
 - **Spike filter** for the touch input (`touch_delay`), plus an adjustable trigger level (`touch_threshold`) for each device
-- **Auto page rotation**: choose pages and interval at runtime
-- **Clock language** switch English/German (`ClockLanguage`), NTP time
+- **Language switch** English/German (`Language`) for all display pages, NTP time
 - **Card page**: send a JSON to the `Card` text entity and it shows title and up to 8 lines in 4 sizes
 - **BLE scanner** counting nearby devices (current and peak), can be switched on and off
 - **Tracker detection**: spots AirTag / Find My, Samsung SmartTag, Tile, Chipolo and Google Find My Device trackers and raises an alert when one stays around
+- **WiFi monitor** with signal graph and a QR code to join the network
+- **Weather** (Open-Meteo, no API key) with indoor / outdoor temperature from Home Assistant
+- **Tea timer** operated by touch, with a ringing alarm and a `TimerRinging` sensor for notifications
 - **Web UI** (v3) with groups, plus OTA, safe mode and encrypted API
 - **Safe mode restart with notice**: the display shows a BOOTMODE hint before the device reboots into safe mode
 - Brightness, rotate interval, clock colors and more as runtime entities, no reflash needed
@@ -44,7 +47,10 @@ The display runs at 40 MHz SPI (`data_rate`), so a frame is pushed quickly and t
    wifi_password: "..."
    ap_password: "..."
    webgui_password: "..."
+   wifi_qr: "WIFI:T:WPA;S:MySSID;P:MyPassword;;"
    ```
+
+   `wifi_qr` is the content of the QR code on the WiFi page. Escape `\ ; , : "` in the SSID or password with a backslash.
 
 3. Adjust the `substitutions` at the top, see [Substitutions](#substitutions).
 4. Flash it. The first flash must be over USB, later updates via OTA.
@@ -61,28 +67,52 @@ All values are plain text that gets pasted into the config, so they are all quot
 | `touch_threshold` | `1450` | Touch trigger level, the pad counts as touched when its raw value drops below this |
 | `touch_setup_mode` | `false` | `true` logs the raw touch values, see [Touch](#touch) |
 | `long_press_ms` | `600` | Hold time in ms |
-| `dim_low` | `5` | Backlight level (%) the clock page dimmer goes down to |
+| `dim_low` | `5` | Backlight level (%) the clock page dimmer goes down to, at or below this level night mode is active |
 | `ble_interval`, `ble_window` | `160ms`, `120ms` | BLE scan timing, the window must be smaller than the interval so WiFi keeps some airtime |
 | `ble_timeout_s` | `45` | A device counts as present this many seconds after its last advertisement |
 | `tracker_timeout_s` | `60` | A tracker is forgotten after this many seconds without advertisement |
 | `tracker_alert_min` | `5` | Alert when a tracker was present this many minutes |
+| `page_count` | `10` | Number of display pages |
+| `weather_plz_default` | `10115` | Default location of the weather page, change it at runtime with `WeatherPLZ` |
+| `weather_country` | `DE` | Country code used when a PLZ or city name is geocoded |
+| `timer_step_s` | `30` | Tea timer: seconds added per hold |
+| `timer_max_min` | `15` | Tea timer: longest time you can set |
+| `timer_start_ms` | `1500` | Tea timer: hold time for start / pause |
+| `timer_reset_ms` | `3000` | Tea timer: hold time for reset |
+| `qr_show_s` | `30` | The QR code on the WiFi page hides itself after this many seconds |
+| `temp_timeout_min` | `30` | `TempIndoor` / `TempOutdoor` count as valid for this many minutes |
 
 ## Pages
 
 | # | Page | Content |
 |---|---|---|
 | 1 | Welcome | "WELCOME", "HA DASHBOARD", "TOUCH ME" and a hint to tap for the next page |
-| 2 | Status | Host, IP, SSID, signal, MAC, uptime, free heap, ESPHome version, build date, BLE count |
-| 3 | Card | Content you send to the `Card` entity (only shown once something was sent) |
+| 2 | Status | Host, IP, MAC, uptime, free heap, ESPHome version, build date, BLE count |
+| 3 | Card | Content you send to the `Card` entity (in the auto rotation only once something was sent) |
 | 4 | Clock | Seconds ring, weekday, time, day progress bar and date |
 | 5 | BLE | Number of BLE devices around, peak and tracker count (frame turns orange on alert) |
 | 6 | Light | Static light page, `PushLight` is active while you hold the touch |
+| 7 | WiFi | Signal in dBm and %, 2 minute graph, min / avg / max, SSID, BSSID, channel, IP. Hold shows the QR code |
+| 8 | Weather | Indoor and outdoor temperature, current conditions with icon, today's high / low and the next 3 days |
+| 9 | Moon | Moon phase drawn as a disc, phase name, lit percentage, age and days to full / new moon |
+| 10 | Timer | Tea timer, see [Tea timer](#tea-timer) |
 
-Pages can be changed with the `DisplayPage` select. `RotatePages` takes a list like `3,4` or `1-4` or `1,3-6`, `RotateInterval` sets the time.
+Pages can be changed with the `DisplayPage` select.
 
-The display refreshes every 250 ms on the clock page (smooth ring and colon fade) and every 500 ms on all other pages.
+**Choosing pages**: both text entities take a list like `3,4` or `1-4` or `1,3-6` (page numbers from the table).
+
+- `EnabledPages` (default `1-10`): pages that can be reached at all. A page that is not listed is skipped by touch and by the auto rotation, for example `1-9` hides the tea timer.
+- `RotatePages` (default `3,4`): pages that take part in the auto rotation, on top of `EnabledPages`. `RotateInterval` sets the time per page, 0 turns the rotation off.
+
+Pages that are not enabled can still be reached on purpose: with the `DisplayPage` select, with `"show": true` from the card, and by the tea timer alarm.
+
+The display refreshes every 250 ms on the clock and timer pages (smooth ring, colon fade and countdown) and every 500 ms on all other pages.
 
 On the status page, characters the font cannot draw (for example emoji in an SSID) are shown as `_`, so they do not flood the log with missing-glyph warnings. The real values stay unchanged in the web UI and Home Assistant.
+
+## Language
+
+The `Language` select switches all display pages between English and German. German texts use ae/oe/ue because the fonts have no umlauts. Dates and weekdays on the clock page follow it too.
 
 ## Clock page
 
@@ -94,14 +124,25 @@ On the status page, characters the font cannot draw (for example emoji in an SSI
 
 **Colors**: digits and bar use the same palette. By day it runs from green over blue to purple. At night it is a dimmed dark red. The change fades in from 20 h to 22 h and out from 5 h to 7 h, so it is easy on the eyes at the bedside. The `ClockBarHue` slider (0-360°) shifts the hue of both palettes, day and night.
 
-**Dimmer**: hold on the clock page to dim the backlight down to `dim_low` (default 5 %). Hold again to go back to the brightness from before. That previous brightness is stored, so it survives a reboot. It goes through the `Brightness` entity, so the slider follows. Without a stored value it returns to 50 %.
+**Dimmer**: hold on the clock page to dim the backlight down to `dim_low` (default 5 %). Hold again to go back to the brightness from before. That previous brightness is stored, so it survives a reboot. It goes through the `Brightness` entity, so the slider follows. Without a stored value it returns to 50 %. While dimmed, [night mode](#night-mode) is active.
+
+## Night mode
+
+Night mode has no switch of its own, it is the dimmer of the clock page: as soon as the `Brightness` is at or below `dim_low` (hold on the clock page, or set the slider yourself), the device shows only the clock.
+
+- The display jumps to the clock page and stays there, no matter what else is set: touch, auto rotation, `DisplayPage` and a card with `"show": true` cannot change the page.
+- A short tap does nothing. Hold on the clock page dims back up and ends night mode.
+- The tea timer alarm still runs (`TimerRinging` turns on for notifications), and a touch acknowledges it.
+- The BOOTMODE notice of the safe mode restart is still shown.
 
 ## Touch
 
-- **Short tap** (on release): next page
+- **Short tap** (on release): next page, only pages from `EnabledPages` (not in night mode)
 - **Hold** (`long_press_ms`, default 600 ms), depends on the page:
-  - Clock page: dimmer toggle, see above.
+  - Clock page: dimmer toggle (night mode), see above.
   - Light page: `PushLight` goes active until you release, use it as a trigger in Home Assistant.
+  - WiFi page: shows the QR code or hides it again. It also hides itself after `qr_show_s` seconds.
+  - Timer page: controls the tea timer, see [Tea timer](#tea-timer).
   - Other pages: nothing, the hold does not change the page.
 - `touch_delay` (default 50 ms): the touch must be active at least this long. If short noise spikes switch pages, raise it, for example to 60 ms.
 
@@ -155,7 +196,7 @@ Send a JSON string to the `Card` text entity (max 255 characters). Every send re
 | `title` | Header, max 24 chars |
 | `line1` ... `line8` | Text lines, only sent lines are drawn, centered vertically |
 | `size1` ... `size8` | `s` (14 px, 26 chars), `m` (20 px, 18), `l` (30 px, 12, default), `xl` (40 px, 9) |
-| `show` | `true` jumps to the card page, otherwise it only updates |
+| `show` | `true` jumps to the card page, otherwise it only updates (ignored in night mode) |
 
 All keys are optional, missing keys are cleared. If the text is not valid JSON it is shown as one single line (max 12 chars).
 
@@ -170,15 +211,53 @@ data:
     {"title": "Server", "line1": "CPU {{ states('sensor.cpu') }}%", "size1": "xl", "show": true}
 ```
 
+## WiFi page
+
+Shows the signal strength (green from -60 dBm, yellow from -70 dBm, red below) as a value, a quality bar and a graph of the last 2 minutes (one sample every 2 seconds), plus min / avg / max, SSID, BSSID, channel and IP.
+
+Hold the touch to show a QR code that lets a phone join the network (content from the `wifi_qr` secret, it includes the password). It hides itself after `qr_show_s` seconds or with another hold.
+
+## Weather
+
+The page shows indoor and outdoor temperature, the current conditions with an icon, today's high and low and the next 3 days. Data comes from [Open-Meteo](https://open-meteo.com) over HTTPS, no API key needed. It refreshes every 15 minutes and after the time sync.
+
+- **Location**: the `WeatherPLZ` text entity takes a PLZ, a city name (`Berlin`) or coordinates (`52.53,13.60`). PLZ and city are geocoded via Open-Meteo (restricted to `weather_country`), coordinates are used directly. The default is `weather_plz_default`.
+- **Indoor / outdoor**: send them from Home Assistant to the `TempIndoor` and `TempOutdoor` numbers. A value counts for `temp_timeout_min` minutes. After that indoor shows `--`, and outdoor falls back to the temperature from the weather service.
+
+```yaml
+action: number.set_value
+target:
+  entity_id: number.brain_tvm1_tempoutdoor
+data:
+  value: "{{ states('sensor.outdoor_temperature') }}"
+```
+
+## Moon
+
+The phase is calculated on the device from the NTP time (mean synodic month, good to about half a day). It shows the disc with the lit part, the phase name, the lit percentage, the age of the moon and the days until the next full and new moon. It needs a valid time, otherwise it shows "NO TIME".
+
+## Tea timer
+
+Everything works with the touch button on page 10, the display highlights the stage your current hold has reached:
+
+| Action | Result |
+|---|---|
+| Tap | Next page |
+| Hold (`long_press_ms`) | `+timer_step_s` seconds. Before the start this sets the time, after `timer_max_min` it wraps to the first step. While running or paused it adds time |
+| Hold longer (`timer_start_ms`) | Start, or pause while running |
+| Hold longest (`timer_reset_ms`) | Reset |
+
+When the time is up, the display jumps to the timer page and flashes `TEA READY!`, and `TimerRinging` turns on (use it for a notification in Home Assistant). Any touch acknowledges the alarm.
+
 ## Entities
 
 Home Assistant sorts them by entity category:
 
 | Section in Home Assistant | Entities |
 |---|---|
-| **Controls** (everything for the display) | `DisplayPage`, `Card`, `Brightness`, `ClockLanguage`, `ClockBarHue`, `RotateInterval`, `RotatePages` |
+| **Controls** (everything for the display) | `DisplayPage`, `Card`, `Brightness`, `Language`, `ClockBarHue`, `RotateInterval`, `EnabledPages`, `RotatePages`, `WeatherPLZ`, `TempIndoor`, `TempOutdoor` |
 | **Configuration** (other things to click) | `BLEScanner` (switch), `ResetBLEPeak` (button) |
-| **Sensors** (display only) | `BLEDevices`, `BLEPeak`, `TrackerCount`, `TrackerInfo`, `TrackerAlert`, `Touch`, `PushLight` |
+| **Sensors** (display only) | `BLEDevices`, `BLEPeak`, `TrackerCount`, `TrackerInfo`, `TrackerAlert`, `Touch`, `PushLight`, `TimerRinging` |
 | **Diagnostic** | `IP`, `Uptime`, `DeviceInfo`, `ResetReason`, WiFi info (see below), `Restart`, `SafeModeRestart`, `LogLevel` |
 
 Notes on single entities:
@@ -187,8 +266,10 @@ Notes on single entities:
 |---|---|
 | `Touch` | Touch input (filtered) |
 | `PushLight` | Active while the touch is held on the light page |
-| `Brightness` | Backlight, default 50 % on a fresh install, also toggled by holding on the clock page |
+| `TimerRinging` | On while the tea timer alarm is ringing |
+| `Brightness` | Backlight, default 50 % on a fresh install, also toggled by holding on the clock page. At or below `dim_low` night mode is active |
 | `ClockBarHue` | Shifts the hue of the clock bar and digits, 0 = default colors |
+| `EnabledPages` / `RotatePages` | Page lists, see [Pages](#pages) |
 | `TrackerInfo` | Type and presence time per tracker, e.g. `FindMy 6:12, Tile 0:40` |
 | `SafeModeRestart` | Shows the BOOTMODE notice on the display, then reboots into safe mode |
 | `ResetReason`, `DeviceInfo` | Boot info |
@@ -211,6 +292,6 @@ To see why it restarted, read the `ResetReason` text after the next boot (browno
 
 ## Notes
 
-- UI texts and entity names are English on purpose, only the clock page can be switched to German.
+- UI texts and entity names are English on purpose, only the display pages can be switched to German.
 - Logging is set to `initial_level: NONE` to save resources. Change it with the `LogLevel` select when you need logs.
 - Renaming an entity changes its Home Assistant ID, the old one then shows as unavailable and can be deleted.

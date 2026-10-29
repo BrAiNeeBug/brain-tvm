@@ -24,6 +24,21 @@ substitutions:
   # Trackers: forget after this many seconds without advert / alert after this many minutes of presence
   tracker_timeout_s: "60"
   tracker_alert_min: "5"
+  # Number of display pages (0-based index in the lambdas)
+  page_count: "10"
+  # Weather page: default PLZ (change it at runtime with the WeatherPLZ text entity) and country code
+  weather_plz_default: "10115"
+  weather_country: "DE"
+  # Tea timer page (touch): hold = +step, longer hold = start/pause, longest hold = reset
+  timer_step_s: "30"
+  timer_max_min: "15"
+  timer_start_ms: "1500"
+  timer_reset_ms: "3000"
+  # WiFi page: the QR code (shown on hold) hides itself again after this many seconds
+  qr_show_s: "30"
+  # Indoor / outdoor temperature sent to the device (TempIndoor / TempOutdoor numbers) counts as
+  # valid for this many minutes; after that indoor shows "--" and outdoor falls back to the weather API
+  temp_timeout_min: "30"
 
 esphome:
   comment: BrAiNTVM_ESP32
@@ -122,6 +137,21 @@ time:
       - 0.de.pool.ntp.org
       - 1.de.pool.ntp.org
       - pool.ntp.org
+    on_time_sync:
+      then:
+        - script.execute: weather_update
+
+# HTTPS requests for the weather (Open-Meteo, no API key)
+http_request:
+  timeout: 10s
+  watchdog_timeout: 15s
+
+# WiFi QR code for the WiFi page. In secrets.yaml:
+#   wifi_qr: "WIFI:T:WPA;S:MySSID;P:MyPassword;;"
+# (escape \ ; , : " in SSID/password with a backslash)
+qr_code:
+  - id: wifi_qr
+    value: !secret wifi_qr
 
 # BLE scanner: remember every advertising device with its last-seen timestamp
 esp32_ble_tracker:
@@ -244,6 +274,160 @@ script:
             id(rotate_counter) = 0;
           }
 
+  # Next page. Only pages listed in EnabledPages are used (touch + rotation).
+  # rotate = true (auto rotation): the page must also be listed in RotatePages and the card page
+  # is skipped until a card was received. Touch (rotate = false) cycles all enabled pages.
+  - id: page_step
+    mode: restart
+    parameters:
+      rotate: bool
+    then:
+      - lambda: |-
+          // parse "1,3-5" style list (page numbers 1-${page_count})
+          auto parse = [](const std::string &cfg, bool *out) {
+            int cur = -1, from = -1;
+            for (size_t i = 0; i <= cfg.size(); i++) {
+              char c = i < cfg.size() ? cfg[i] : ',';
+              if (c >= '0' && c <= '9') {
+                cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
+              } else if (c == '-') {
+                from = cur;
+                cur = -1;
+              } else if (c == ',' || c == ';' || c == '.') {
+                if (cur >= 0) {
+                  int lo = from >= 0 ? from : cur;
+                  int hi = cur;
+                  if (lo > hi) std::swap(lo, hi);
+                  for (int pg = lo; pg <= hi; pg++)
+                    if (pg >= 1 && pg <= ${page_count})
+                      out[pg - 1] = true;
+                }
+                cur = -1;
+                from = -1;
+              }
+            }
+          };
+
+          bool en[${page_count}] = {};
+          parse(id(enabled_pages).state, en);
+          if (rotate) {
+            bool listed[${page_count}] = {};
+            parse(id(rotate_pages).state, listed);
+            for (int i = 0; i < ${page_count}; i++)
+              en[i] = en[i] && listed[i];
+            // Card page only once a card was received
+            en[2] = en[2] && id(card_received);
+          }
+
+          for (int step = 1; step <= ${page_count}; step++) {
+            int next = (id(screen_page) + step) % ${page_count};
+            if (en[next]) {
+              id(screen_page) = next;
+              break;
+            }
+          }
+          id(rotate_counter) = 0;
+
+  # Weather: PLZ -> coordinates (geocoding only when the PLZ changed or nothing is stored yet),
+  # then current weather + 4 day forecast
+  - id: weather_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return (id(w_lat) == 0.0f && id(w_lon) == 0.0f) || id(w_geo_dirty);'
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  std::string q = id(w_plz).empty() ? id(weather_plz).state : id(w_plz);
+                  std::string e;  // URL-encode (umlauts, spaces)
+                  for (unsigned char c : q) {
+                    if (isalnum(c) || c == '-' || c == '_' || c == '.') {
+                      e += (char) c;
+                    } else {
+                      char b[4];
+                      snprintf(b, sizeof(b), "%%%02X", c);
+                      e += b;
+                    }
+                  }
+                  return "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&countryCode=${weather_country}&name=" + e;
+                capture_response: true
+                max_response_buffer_size: 2048
+                on_response:
+                  then:
+                    - lambda: |-
+                        bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+                          JsonArray res = root["results"];
+                          if (res.isNull() || res.size() == 0) {
+                            id(w_city) = "NOT FOUND";
+                            return false;
+                          }
+                          JsonObject r = res[0];
+                          id(w_lat) = r["latitude"].as<float>();
+                          id(w_lon) = r["longitude"].as<float>();
+                          id(w_city) = r["name"].as<std::string>();
+                          id(w_geo_dirty) = false;
+                          ESP_LOGI("weather", "Location: %s (%.4f, %.4f)",
+                                   id(w_city).c_str(), id(w_lat), id(w_lon));
+                          return true;
+                        });
+                        id(w_status) = "GEO " + std::to_string(response->status_code) + (ok ? " OK" : " FAIL");
+                        if (!ok)
+                          ESP_LOGW("weather", "Geocoding failed: %s", body.c_str());
+                on_error:
+                  then:
+                    - lambda: 'id(w_status) = "GEO NET ERROR";'
+      - if:
+          condition:
+            lambda: 'return id(w_lat) != 0.0f || id(w_lon) != 0.0f;'
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  char u[260];
+                  snprintf(u, sizeof(u),
+                           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+                           "&current=temperature_2m,weather_code"
+                           "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+                           "&timezone=auto&forecast_days=4",
+                           id(w_lat), id(w_lon));
+                  return std::string(u);
+                capture_response: true
+                max_response_buffer_size: 3072
+                on_response:
+                  then:
+                    - lambda: |-
+                        bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+                          JsonObject cur = root["current"];
+                          JsonObject day = root["daily"];
+                          if (cur.isNull() || day.isNull())
+                            return false;
+                          JsonArray codes = day["weather_code"];
+                          JsonArray mx = day["temperature_2m_max"];
+                          JsonArray mn = day["temperature_2m_min"];
+                          size_t n = codes.size();
+                          if (mx.size() < n) n = mx.size();
+                          if (mn.size() < n) n = mn.size();
+                          id(w_dcode).clear();
+                          id(w_dmax).clear();
+                          id(w_dmin).clear();
+                          for (size_t i = 0; i < n; i++) {
+                            id(w_dcode).push_back(codes[i].as<int>());
+                            id(w_dmax).push_back(mx[i].as<float>());
+                            id(w_dmin).push_back(mn[i].as<float>());
+                          }
+                          id(w_temp) = cur["temperature_2m"].as<float>();
+                          id(w_code) = cur["weather_code"].as<int>();
+                          id(w_valid) = n > 0;
+                          ESP_LOGI("weather", "Updated: %.1f C, code %d", id(w_temp), id(w_code));
+                          return true;
+                        });
+                        id(w_status) = "FC " + std::to_string(response->status_code) + (ok ? " OK" : " FAIL");
+                        if (!ok)
+                          ESP_LOGW("weather", "Forecast failed: %s", body.c_str());
+                on_error:
+                  then:
+                    - lambda: 'id(w_status) = "FC NET ERROR";'
+
 # Display SPI
 spi:
   clk_pin: GPIO14
@@ -269,7 +453,7 @@ esp32_touch:
   setup_mode: ${touch_setup_mode}
 
 # Current page and card content
-# Pages: 0 = welcome, 1 = system status, 2 = card, 3 = clock, 4 = BLE scanner, 5 = light
+# Pages: 0 = welcome, 1 = system status, 2 = card, 3 = clock, 4 = BLE scanner, 5 = light, 6 = WiFi monitor (hold = QR code), 7 = weather, 8 = moon, 9 = tea timer
 globals:
   # Brightness (%) before the clock dimmer was activated, restored on the next hold
   - id: dim_prev
@@ -354,6 +538,116 @@ globals:
     restore_value: false
     initial_value: "false"
 
+  # Weather: location (kept in flash, geocoded from the PLZ), current values, forecast (today + 3 days)
+  - id: w_lat
+    type: float
+    restore_value: true
+    initial_value: "0"
+
+  - id: w_lon
+    type: float
+    restore_value: true
+    initial_value: "0"
+
+  # PLZ was changed and still has to be geocoded
+  - id: w_geo_dirty
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: w_plz
+    type: std::string
+    restore_value: false
+
+  - id: w_city
+    type: std::string
+    restore_value: false
+
+  # last weather request result (shown on the weather page while there is no data)
+  - id: w_status
+    type: std::string
+    restore_value: false
+
+  # millis() of the last TempIndoor / TempOutdoor value (0 = never received)
+  - id: t_in_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: t_out_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # WiFi monitor: RSSI history (one sample every 2 s, 60 samples = 2 min) and QR code view (hold on the WiFi page)
+  - id: w_rssi_hist
+    type: std::vector<float>
+    restore_value: false
+
+  - id: wifi_qr_show
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: wifi_qr_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # Tea timer: 0 = ready, 1 = running, 2 = paused, 3 = done (alarm until touched)
+  - id: timer_state
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: timer_set_s
+    type: int
+    restore_value: true
+    initial_value: "180"
+
+  # running: millis() at which the timer ends / paused: milliseconds left / total of the current run (progress bar)
+  - id: timer_end_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: timer_rem_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: timer_total_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: w_valid
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: w_temp
+    type: float
+    restore_value: false
+    initial_value: "0"
+
+  - id: w_code
+    type: int
+    restore_value: false
+    initial_value: "3"
+
+  - id: w_dcode
+    type: std::vector<int>
+    restore_value: false
+
+  - id: w_dmax
+    type: std::vector<float>
+    restore_value: false
+
+  - id: w_dmin
+    type: std::vector<float>
+    restore_value: false
+
 # Fonts
 font:
   - file: "gfonts://Roboto Mono"
@@ -402,11 +696,47 @@ binary_sensor:
     on_release:
       then:
         - lambda: |-
-            if (id(push_long)) {
+            uint32_t held = millis() - id(push_ts);
+            if ((id(screen_page) == 9 || (id(backlight_pct).state <= ${dim_low})) && id(timer_state) == 3) {
+              // tea timer alarm: any touch acknowledges it
+              id(timer_state) = 0;
+            } else if (id(screen_page) == 9 && held >= ${long_press_ms}) {
+              // tea timer: the length of the hold decides (the display shows the current stage)
+              uint32_t now = millis();
+              if (held >= ${timer_reset_ms}) {
+                id(timer_state) = 0;
+              } else if (held >= ${timer_start_ms}) {
+                if (id(timer_state) == 1) {
+                  int32_t left = (int32_t) (id(timer_end_ms) - now);
+                  id(timer_rem_ms) = left > 0 ? left : 0;
+                  id(timer_state) = 2;
+                } else {
+                  if (id(timer_state) == 0) {
+                    id(timer_rem_ms) = id(timer_set_s) * 1000UL;
+                    id(timer_total_ms) = id(timer_rem_ms);
+                  }
+                  id(timer_end_ms) = now + id(timer_rem_ms);
+                  id(timer_state) = 1;
+                }
+              } else {
+                if (id(timer_state) == 1) {
+                  id(timer_end_ms) += ${timer_step_s} * 1000UL;
+                  id(timer_total_ms) += ${timer_step_s} * 1000UL;
+                } else if (id(timer_state) == 2) {
+                  id(timer_rem_ms) += ${timer_step_s} * 1000UL;
+                  id(timer_total_ms) += ${timer_step_s} * 1000UL;
+                } else {
+                  id(timer_set_s) += ${timer_step_s};
+                  if (id(timer_set_s) > ${timer_max_min} * 60)
+                    id(timer_set_s) = ${timer_step_s};
+                }
+              }
+            } else if (id(push_long)) {
               // end of hold: release the page button
               id(push_light).publish_state(false);
-            } else {
-              id(screen_page) = (id(screen_page) + 1) % 6;
+            } else if (!(id(backlight_pct).state <= ${dim_low})) {
+              // next enabled page (night mode = dimmed: clock only, no switching)
+              id(page_step).execute(false);
             }
             id(rotate_counter) = 0;
 
@@ -422,6 +752,17 @@ binary_sensor:
     web_server:
       sorting_group_id: grp_ble
       sorting_weight: 5
+
+  # On while the tea timer alarm is ringing (e.g. notify from HA)
+  - platform: template
+    name: "TimerRinging"
+    id: timer_ringing
+    icon: "mdi:timer-alert"
+    lambda: |-
+      return id(timer_state) == 3;
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 11
 
   - platform: template
     name: "PushLight"
@@ -474,13 +815,17 @@ select:
       - "4 Clock"
       - "5 BLE"
       - "6 Light"
+      - "7 WiFi"
+      - "8 Weather"
+      - "9 Moon"
+      - "10 Timer"
     lambda: |-
-      static const char *names[] = {"1 Welcome", "2 Status", "3 Card", "4 Clock", "5 BLE", "6 Light"};
-      return std::string(names[id(screen_page) % 6]);
+      static const char *names[] = {"1 Welcome", "2 Status", "3 Card", "4 Clock", "5 BLE", "6 Light", "7 WiFi", "8 Weather", "9 Moon", "10 Timer"};
+      return std::string(names[id(screen_page) % ${page_count}]);
     set_action:
       - lambda: |-
-          int p = x[0] - '1';
-          if (p >= 0 && p < 6)
+          int p = atoi(x.c_str()) - 1;  // option starts with the page number ("10 Timer")
+          if (p >= 0 && p < ${page_count})
             id(screen_page) = p;
           id(rotate_counter) = 0;
     icon: "mdi:monitor-dashboard"
@@ -488,9 +833,9 @@ select:
       sorting_group_id: grp_display
       sorting_weight: 2
 
-  # Language of the clock page (weekday, date, texts). Everything else stays English.
+  # Language of all display pages (German texts use ae/oe/ue, the fonts have no umlauts)
   - platform: template
-    name: "ClockLanguage"
+    name: "Language"
     id: clock_lang
     optimistic: true
     restore_value: true
@@ -558,6 +903,39 @@ number:
       sorting_group_id: grp_display
       sorting_weight: 5
 
+  # Indoor / outdoor temperature for the weather page: send it from HA (number.set_value) or the web UI
+  - platform: template
+    name: "TempIndoor"
+    id: temp_indoor
+    optimistic: true
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    mode: BOX
+    unit_of_measurement: "°C"
+    device_class: temperature
+    set_action:
+      - lambda: 'id(t_in_ms) = millis();'
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 8
+
+  - platform: template
+    name: "TempOutdoor"
+    id: temp_outdoor
+    optimistic: true
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    mode: BOX
+    unit_of_measurement: "°C"
+    device_class: temperature
+    set_action:
+      - lambda: 'id(t_out_ms) = millis();'
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 9
+
 text:
   # Card for the card page: send the JSON as text (Web UI field or HA action text.set_value).
   # Every send replaces the whole card, max 255 chars.
@@ -593,8 +971,25 @@ text:
       sorting_group_id: grp_display
       sorting_weight: 6
 
+  # Pages that can be reached at all (touch + rotation), same syntax, e.g. "1-8" = timer off
+  # Pages not listed here are skipped everywhere except manual DisplayPage / card "show"
+  - platform: template
+    name: "EnabledPages"
+    id: enabled_pages
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "1-10"
+    min_length: 0
+    max_length: 16
+    icon: "mdi:file-eye-outline"
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 5
+
   # Pages that take part in the auto rotation, e.g. "3,4" or "1-4" or "1,3-6"
-  # 1 = Welcome, 2 = Status, 3 = Card, 4 = Clock, 5 = BLE, 6 = Light
+  # 1 = Welcome, 2 = Status, 3 = Card, 4 = Clock, 5 = BLE, 6 = Light, 7 = WiFi, 8 = Weather, 9 = Moon, 10 = Timer
+  # (hold on the WiFi page shows the QR code incl. the password)
   - platform: template
     name: "RotatePages"
     id: rotate_pages
@@ -608,6 +1003,35 @@ text:
     web_server:
       sorting_group_id: grp_display
       sorting_weight: 5
+
+  # Location for the weather page: PLZ, city name ("Berlin") or coordinates ("52.53,13.60"),
+  # PLZ / city are geocoded via Open-Meteo, coordinates are used directly
+  - platform: template
+    name: "WeatherPLZ"
+    id: weather_plz
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "${weather_plz_default}"
+    min_length: 2
+    max_length: 32
+    icon: "mdi:map-marker"
+    set_action:
+      - lambda: |-
+          id(w_plz) = x;
+          float la, lo;
+          if (sscanf(x.c_str(), "%f,%f", &la, &lo) == 2) {
+            id(w_lat) = la;
+            id(w_lon) = lo;
+            id(w_city) = "MANUAL";
+            id(w_geo_dirty) = false;
+          } else {
+            id(w_geo_dirty) = true;
+          }
+      - script.execute: weather_update
+    web_server:
+      sorting_group_id: grp_display
+      sorting_weight: 7
 
 button:
   - platform: restart
@@ -791,6 +1215,7 @@ text_sensor:
         sorting_weight: 2
     bssid:
       name: "WiFiBSSID"
+      id: wifi_bssid_text
       entity_category: diagnostic
       web_server:
         sorting_group_id: grp_network
@@ -921,16 +1346,22 @@ interval:
   - interval: 50ms
     then:
       - lambda: |-
+          // night mode (clock dimmer active = brightness at dim_low): clock page only
+          if ((id(backlight_pct).state <= ${dim_low}) && id(screen_page) != 3) {
+            id(screen_page) = 3;
+            id(rotate_counter) = 0;
+          }
           static uint32_t last = 0;
           uint32_t now = millis();
-          uint32_t period = (id(screen_page) == 3) ? 250 : 500;
+          uint32_t period = (id(screen_page) == 3 || id(screen_page) == 9) ? 250 : 500;
           if (now - last >= period) {
             last = now;
             id(main_display).update();
           }
 
   # Hold detection: after long_press_ms the page button of the current page goes active
-  # (clock page: toggles the dimmer instead)
+  # (clock page: toggles the dimmer = night mode, only the clock is shown while dimmed;
+  #  WiFi page: toggles the QR code)
   - interval: 50ms
     then:
       - lambda: |-
@@ -942,6 +1373,10 @@ interval:
           id(rotate_counter) = 0;
           if (id(screen_page) == 5)
             id(push_light).publish_state(true);
+          if (id(screen_page) == 6) {
+            id(wifi_qr_show) = !id(wifi_qr_show);
+            id(wifi_qr_ms) = millis();
+          }
           if (id(screen_page) == 3) {
             // dimmed -> back to the brightness from before, otherwise remember it and dim
             float cur = id(backlight_pct).state;
@@ -957,52 +1392,42 @@ interval:
             call.perform();
           }
 
-  # Automatic page rotation
+  # WiFi monitor: RSSI sample for the graph (-127 = not connected)
+  - interval: 2s
+    then:
+      - lambda: |-
+          int r = wifi::global_wifi_component->wifi_rssi();
+          id(w_rssi_hist).push_back(r > -120 && r < 0 ? (float) r : NAN);
+          if (id(w_rssi_hist).size() > 60)
+            id(w_rssi_hist).erase(id(w_rssi_hist).begin());
+
+  # Tea timer: end detection, jump to the timer page and ring
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(timer_state) == 1 && (int32_t) (id(timer_end_ms) - millis()) <= 0) {
+            id(timer_state) = 3;
+            id(screen_page) = 9;
+            id(rotate_counter) = 0;
+          }
+
+  # Weather refresh
+  - interval: 15min
+    then:
+      - script.execute: weather_update
+
+  # Automatic page rotation (enabled pages + RotatePages list, see page_step)
   - interval: 1s
     then:
       - if:
           condition:
-            lambda: 'return id(rotate_seconds).state >= 1;'
+            lambda: 'return id(rotate_seconds).state >= 1 && id(timer_state) != 3 && !(id(backlight_pct).state <= ${dim_low});'
           then:
             - lambda: |-
                 id(rotate_counter)++;
                 if (id(rotate_counter) >= (int) id(rotate_seconds).state) {
                   id(rotate_counter) = 0;
-
-                  // parse "1,3-5" style list (page numbers 1-6) from RotatePages
-                  const std::string &cfg = id(rotate_pages).state;
-                  bool enabled[6] = {false, false, false, false, false, false};
-                  int cur = -1, from = -1;
-                  for (size_t i = 0; i <= cfg.size(); i++) {
-                    char c = i < cfg.size() ? cfg[i] : ',';
-                    if (c >= '0' && c <= '9') {
-                      cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
-                    } else if (c == '-') {
-                      from = cur;
-                      cur = -1;
-                    } else if (c == ',' || c == ';' || c == '.') {
-                      if (cur >= 0) {
-                        int lo = from >= 0 ? from : cur;
-                        int hi = cur;
-                        if (lo > hi) std::swap(lo, hi);
-                        for (int pg = lo; pg <= hi; pg++)
-                          if (pg >= 1 && pg <= 6)
-                            enabled[pg - 1] = true;
-                      }
-                      cur = -1;
-                      from = -1;
-                    }
-                  }
-                  // Card page only once a card was received
-                  enabled[2] = enabled[2] && id(card_received);
-
-                  for (int step = 1; step <= 6; step++) {
-                    int next = (id(screen_page) + step) % 6;
-                    if (enabled[next]) {
-                      id(screen_page) = next;
-                      break;
-                    }
-                  }
+                  id(page_step).execute(true);
                 }
 
 # ST7789 display
@@ -1023,6 +1448,34 @@ display:
     lambda: |-
       it.fill(Color(0, 0, 0));
 
+      // QR code view only on the WiFi page and only for qr_show_s seconds
+      if (id(screen_page) != 6 || (id(wifi_qr_show) && millis() - id(wifi_qr_ms) > ${qr_show_s} * 1000UL))
+        id(wifi_qr_show) = false;
+
+      // The fonts have no glyphs for non-ASCII characters (e.g. emoji in the SSID) and the missing
+      // codepoint would spam the log: replace each multi-byte character with "_" and cut to maxlen
+      auto clean_ascii = [](std::string value, size_t maxlen) {
+        std::string clean;
+        for (size_t i = 0; i < value.size(); i++) {
+          unsigned char ch = value[i];
+          if (ch < 0x80) {
+            clean += (char) ch;
+          } else {
+            clean += '_';
+            while (i + 1 < value.size() && ((unsigned char) value[i + 1] & 0xC0) == 0x80)
+              i++;
+          }
+        }
+        if (clean.length() > maxlen)
+          clean.resize(maxlen);
+        return clean;
+      };
+
+      // Language of the Language select: tr("english", "deutsch") for plain texts,
+      // `de ? "..." : "..."` where the text is a printf format
+      bool de = id(clock_lang).active_index().value_or(0) == 1;
+      auto tr = [de](const char *en, const char *dg) { return de ? dg : en; };
+
       // BOOT / OTA NOTICE (shown before safe mode restart and during OTA)
       if (id(boot_notice) != 0) {
         it.rectangle(4, 4, 232, 232,
@@ -1031,7 +1484,7 @@ display:
         if (id(boot_notice) == 1) {
           it.print(120, 30, id(value_font),
                    Color(255, 160, 0),
-                   TextAlign::TOP_CENTER, "BOOTMODE");
+                   TextAlign::TOP_CENTER, tr("BOOTMODE", "BOOTMODUS"));
 
           it.print(120, 80, id(terminal_font),
                    Color(255, 160, 0),
@@ -1041,33 +1494,33 @@ display:
 
           it.print(120, 120, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "WIFI + OTA ONLY");
+                   TextAlign::TOP_CENTER, tr("WIFI + OTA ONLY", "NUR WLAN + OTA"));
 
           it.print(120, 142, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "DISPLAY STAYS FROZEN");
+                   TextAlign::TOP_CENTER, tr("DISPLAY STAYS FROZEN", "DISPLAY BLEIBT STEHEN"));
 
           it.print(120, 175, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "FLASH NEW FIRMWARE");
+                   TextAlign::TOP_CENTER, tr("FLASH NEW FIRMWARE", "NEUE FIRMWARE FLASHEN"));
 
           it.print(120, 197, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "OR WAIT FOR REBOOT");
+                   TextAlign::TOP_CENTER, tr("OR WAIT FOR REBOOT", "ODER AUF NEUSTART WARTEN"));
         } else {
           it.print(120, 30, id(value_font),
                    Color(255, 160, 0),
-                   TextAlign::TOP_CENTER, "OTA UPDATE");
+                   TextAlign::TOP_CENTER, tr("OTA UPDATE", "OTA-UPDATE"));
 
           it.line(15, 105, 225, 105, Color(120, 80, 0));
 
           it.print(120, 125, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "FLASHING...");
+                   TextAlign::TOP_CENTER, tr("FLASHING...", "FLASHE..."));
 
           it.print(120, 155, id(terminal_font),
                    Color(255, 200, 80),
-                   TextAlign::TOP_CENTER, "DO NOT POWER OFF");
+                   TextAlign::TOP_CENTER, tr("DO NOT POWER OFF", "NICHT AUSSCHALTEN"));
         }
         return;
       }
@@ -1079,7 +1532,7 @@ display:
 
         it.print(120, 30, id(value_font),
                  Color(0, 255, 90),
-                 TextAlign::TOP_CENTER, "WELCOME");
+                 TextAlign::TOP_CENTER, tr("WELCOME", "WILLKOMMEN"));
 
         it.print(120, 80, id(terminal_font),
                  Color(0, 180, 70),
@@ -1090,66 +1543,42 @@ display:
 
         it.print(120, 130, id(medium_font),
                  Color(0, 255, 90),
-                 TextAlign::TOP_CENTER, "TOUCH ME");
+                 TextAlign::TOP_CENTER, tr("TOUCH ME", "FASS MICH AN"));
 
         it.print(120, 185, id(terminal_font),
                  Color(0, 200, 90),
-                 TextAlign::TOP_CENTER, "> NEXT PAGE");
+                 TextAlign::TOP_CENTER, tr("> NEXT PAGE", "> WEITER"));
       }
 
       // PAGE 1: SYSTEM STATUS
       else if (id(screen_page) == 1) {
         it.print(8, 8, id(terminal_font),
-                 Color(0, 255, 90), "SYSTEM STATUS");
+                 Color(0, 255, 90), tr("SYSTEM STATUS", "SYSTEMSTATUS"));
 
         it.line(8, 30, 232, 30,
                 Color(0, 120, 50));
 
         auto row = [&](int y, const char *label, std::string value) {
-          // The font has no glyphs for non-ASCII characters (e.g. emoji in the SSID) and the
-          // missing codepoint would spam the log: replace each multi-byte character with "_"
-          std::string clean;
-          for (size_t i = 0; i < value.size(); i++) {
-            unsigned char ch = value[i];
-            if (ch < 0x80) {
-              clean += (char) ch;
-            } else {
-              clean += '_';
-              while (i + 1 < value.size() && ((unsigned char) value[i + 1] & 0xC0) == 0x80)
-                i++;
-            }
-          }
-          value = clean;
-          if (value.length() > 18)
-            value.resize(18);
           it.print(8, y, id(terminal_font),
                    Color(0, 180, 70), label);
           it.print(84, y, id(terminal_font),
-                   Color(0, 255, 90), value.c_str());
+                   Color(0, 255, 90), clean_ascii(value, 18).c_str());
         };
 
         row(38, "HOST", "${device_name}");
         row(56, "IP", id(wifi_ip).state);
-        row(74, "SSID", id(wifi_ssid_text).state);
+        row(74, "MAC", id(wifi_mac_text).state);
+        row(92, tr("UPTIME", "LAUFZEIT"), id(uptime_text).state);
+
         char buf[24];
+        snprintf(buf, sizeof(buf), de ? "%u KB frei" : "%u KB free", (unsigned) (esp_get_free_heap_size() / 1024));
+        row(110, "HEAP", buf);
 
-        if (std::isnan(id(wifi_signal_rssi).state))
-          snprintf(buf, sizeof(buf), "--");
-        else
-          snprintf(buf, sizeof(buf), "%.0f dBm", id(wifi_signal_rssi).state);
-        row(92, "SIGNAL", buf);
+        row(128, "ESPHOME", ESPHOME_VERSION);
+        row(146, tr("BUILT", "GEBAUT"), __DATE__);
 
-        row(110, "MAC", id(wifi_mac_text).state);
-        row(128, "UPTIME", id(uptime_text).state);
-
-        snprintf(buf, sizeof(buf), "%u KB free", (unsigned) (esp_get_free_heap_size() / 1024));
-        row(146, "HEAP", buf);
-
-        row(164, "ESPHOME", ESPHOME_VERSION);
-        row(182, "BUILT", __DATE__);
-
-        snprintf(buf, sizeof(buf), "%d devices", id(ble_count));
-        row(200, "BLE", buf);
+        snprintf(buf, sizeof(buf), de ? "%d Geraete" : "%d devices", id(ble_count));
+        row(164, "BLE", buf);
       }
 
       // PAGE 2: CARD (title + up to 8 lines, font size per line)
@@ -1202,16 +1631,15 @@ display:
           }
         } else {
           it.print(12, 75, id(terminal_font),
-                   Color(0, 255, 90), "WAITING FOR DATA");
+                   Color(0, 255, 90), tr("WAITING FOR DATA", "WARTE AUF DATEN"));
 
           it.print(12, 105, id(terminal_font),
-                   Color(0, 180, 70), "Card text entity");
+                   Color(0, 180, 70), tr("Card text entity", "Card-Textfeld"));
         }
       }
 
-      // PAGE 3: CLOCK (language from the ClockLanguage select)
+      // PAGE 3: CLOCK
       else if (id(screen_page) == 3) {
-        bool de = id(clock_lang).active_index().value_or(0) == 1;
         auto now = id(sntp_time).now();
 
         if (now.is_valid()) {
@@ -1290,8 +1718,9 @@ display:
           static const uint8_t wg[] = {0, 70, 80, 160, 230, 255, 200, 110};
           static const uint8_t wb[] = {0, 200, 80, 40, 60, 120, 255, 255};
           int wd = now.day_of_week;
+          Color day_col = Color(wr[wd], wg[wd], wb[wd]);
           it.printf(120, 36, id(value_font),
-                    Color(wr[wd], wg[wd], wb[wd]),
+                    day_col,
                     TextAlign::TOP_CENTER, "%s",
                     de ? weekdays_de[wd] : weekdays_en[wd]);
 
@@ -1325,9 +1754,9 @@ display:
           it.filled_rectangle(bx + cur * 2 - 1, 168, 4, 12,
                               dim(Color(255, 255, 255), 1.0f - 0.6f * night));
 
-          // ---------- date ----------
+          // ---------- date (same color as the weekday) ----------
           it.strftime(120, 186, id(value_font),
-                      Color(210, 215, 235),
+                      day_col,
                       TextAlign::TOP_CENTER, de ? "%d.%m.%Y" : "%b %d, %Y", now);
         } else {
           it.print(12, 75, id(terminal_font),
@@ -1355,20 +1784,20 @@ display:
 
         it.print(120, 125, id(terminal_font),
                  Color(0, 200, 90),
-                 TextAlign::TOP_CENTER, "DEVICES (LAST ${ble_timeout_s}s)");
+                 TextAlign::TOP_CENTER, tr("DEVICES (LAST ${ble_timeout_s}s)", "GERAETE (LETZTE ${ble_timeout_s}s)"));
 
         it.line(15, 165, 225, 165,
                 Color(0, 100, 40));
 
         it.printf(120, 180, id(terminal_font),
                   Color(0, 180, 70),
-                  TextAlign::TOP_CENTER, "PEAK: %d",
+                  TextAlign::TOP_CENTER, de ? "SPITZE: %d" : "PEAK: %d",
                   id(ble_peak));
 
         if (!id(ble_scan_switch).state) {
           it.print(120, 205, id(terminal_font),
                    Color(255, 160, 0),
-                   TextAlign::TOP_CENTER, "SCANNER OFF");
+                   TextAlign::TOP_CENTER, tr("SCANNER OFF", "SCANNER AUS"));
         } else {
           it.printf(120, 205, id(terminal_font),
                     trk_alert ? Color(255, 160, 0) : Color(0, 180, 70),
@@ -1379,7 +1808,7 @@ display:
       }
 
       // PAGE 5: LIGHT (static)
-      else {
+      else if (id(screen_page) == 5) {
         it.rectangle(4, 4, 232, 232,
                      Color(0, 180, 70));
 
@@ -1387,11 +1816,11 @@ display:
                             Color(0, 65, 30));
 
         it.print(10, 11, id(terminal_font),
-                 Color(0, 255, 90), "LIGHT");
+                 Color(0, 255, 90), tr("LIGHT", "LICHT"));
 
         it.print(120, 75, id(clock_font),
                  Color(0, 255, 90),
-                 TextAlign::TOP_CENTER, "LIGHT");
+                 TextAlign::TOP_CENTER, tr("LIGHT", "LICHT"));
 
         it.line(30, 135, 210, 135,
                 Color(0, 100, 40));
@@ -1402,6 +1831,358 @@ display:
 
         it.print(120, 195, id(terminal_font),
                  Color(0, 180, 70),
-                 TextAlign::TOP_CENTER, "HOLD = PUSH");
+                 TextAlign::TOP_CENTER, tr("HOLD = PUSH", "HALTEN = DRUECKEN"));
+      }
+
+      // PAGE 6: WIFI MONITOR (signal + graph), hold = QR code to join the network
+      else if (id(screen_page) == 6) {
+        it.rectangle(4, 4, 232, 232,
+                     Color(0, 180, 70));
+
+        it.filled_rectangle(5, 5, 230, 28,
+                            Color(0, 65, 30));
+
+        if (id(wifi_qr_show)) {
+          it.print(10, 11, id(terminal_font),
+                   Color(0, 255, 90), tr("SCAN TO JOIN", "QR-CODE"));
+          it.print(230, 11, id(terminal_font),
+                   Color(0, 200, 90), TextAlign::TOP_RIGHT, tr("HOLD = BACK", "HALTEN = ZURUECK"));
+
+          // white box with 2 modules quiet zone, black modules (phones need dark on light)
+          int n = id(wifi_qr)->get_size();
+          int scale = 190 / (n + 4);
+          if (scale < 1)
+            scale = 1;
+          int box = (n + 4) * scale;
+          int bx = (240 - box) / 2;
+          int by = 34 + (198 - box) / 2;
+          it.filled_rectangle(bx, by, box, box, Color(255, 255, 255));
+          it.qr_code(bx + 2 * scale, by + 2 * scale, id(wifi_qr), Color(0, 0, 0), scale);
+        } else {
+          it.print(10, 11, id(terminal_font),
+                   Color(0, 255, 90), tr("WIFI MONITOR", "WLAN-MONITOR"));
+          it.print(230, 11, id(terminal_font),
+                   Color(0, 200, 90), TextAlign::TOP_RIGHT, tr("HOLD = QR", "HALTEN = QR"));
+
+          // green >= -60 dBm, yellow >= -70 dBm, red below
+          auto sig_col = [](float v) {
+            return v >= -60 ? Color(0, 255, 90) : (v >= -70 ? Color(255, 200, 0) : Color(255, 70, 60));
+          };
+
+          const std::vector<float> &h = id(w_rssi_hist);
+          float rssi = h.empty() ? NAN : h.back();
+          Color sc = std::isnan(rssi) ? Color(120, 120, 120) : sig_col(rssi);
+
+          // ---------- current value + quality bar ----------
+          float q = 0;
+          if (!std::isnan(rssi)) {
+            q = 2.0f * (rssi + 100.0f);
+            if (q < 0) q = 0;
+            if (q > 100) q = 100;
+            it.printf(12, 40, id(value_font), sc, "%.0f dBm", rssi);
+            it.printf(228, 40, id(value_font), sc, TextAlign::TOP_RIGHT, "%.0f%%", q);
+          } else {
+            it.print(12, 40, id(value_font), sc, "-- dBm");
+          }
+          it.rectangle(12, 76, 216, 8, Color(0, 100, 40));
+          it.filled_rectangle(12, 76, (int) (q * 2.16f), 8, sc);
+
+          // ---------- graph: last 2 minutes, -40 (top) .. -100 dBm (bottom) ----------
+          const int gx = 42, gy = 90, gw = 180, gh = 72;
+          it.rectangle(gx - 1, gy - 1, gw + 2, gh + 2, Color(0, 100, 40));
+          auto ypos = [&](float v) {
+            if (v > -40) v = -40;
+            if (v < -100) v = -100;
+            return gy + (int) ((-40 - v) * gh / 60.0f);
+          };
+          for (int g = -50; g >= -90; g -= 20) {
+            it.line(gx, ypos(g), gx + gw - 1, ypos(g), Color(0, 55, 25));
+            it.printf(gx - 4, ypos(g) - 7, id(terminal_font), Color(0, 140, 60),
+                      TextAlign::TOP_RIGHT, "%d", g);
+          }
+          int n = h.size();
+          for (int i = 1; i < n; i++) {
+            if (std::isnan(h[i]) || std::isnan(h[i - 1]))
+              continue;
+            int x1 = gx + (60 - n + i - 1) * 3;
+            it.line(x1, ypos(h[i - 1]), x1 + 3, ypos(h[i]), sig_col(h[i]));
+            it.line(x1, ypos(h[i - 1]) + 1, x1 + 3, ypos(h[i]) + 1, sig_col(h[i]));
+          }
+
+          // ---------- min / avg / max of the graph window ----------
+          float mn = 0, mx = 0, sum = 0;
+          int cnt = 0;
+          for (float v : h) {
+            if (std::isnan(v))
+              continue;
+            if (cnt == 0 || v < mn) mn = v;
+            if (cnt == 0 || v > mx) mx = v;
+            sum += v;
+            cnt++;
+          }
+          if (cnt > 0)
+            it.printf(120, 166, id(terminal_font), Color(0, 200, 90), TextAlign::TOP_CENTER,
+                      de ? "MIN %.0f MIT %.0f MAX %.0f" : "MIN %.0f AVG %.0f MAX %.0f", mn, sum / cnt, mx);
+
+          // ---------- network info ----------
+          auto info = [&](int y, const char *label, std::string v) {
+            it.print(12, y, id(terminal_font), Color(0, 180, 70), label);
+            it.print(60, y, id(terminal_font), Color(0, 255, 90), clean_ascii(v, 20).c_str());
+          };
+          info(184, "SSID", id(wifi_ssid_text).state);
+          info(200, "AP", id(wifi_bssid_text).state);
+          char cb[40];
+          snprintf(cb, sizeof(cb), "%d / %s", (int) wifi::global_wifi_component->get_wifi_channel(),
+                   id(wifi_ip).state.c_str());
+          info(216, "CH/IP", cb);
+        }
+      }
+
+      // PAGE 7: WEATHER (indoor/outdoor from HA, conditions + forecast from Open-Meteo)
+      else if (id(screen_page) == 7) {
+        it.rectangle(4, 4, 232, 232,
+                     Color(0, 180, 70));
+
+        it.filled_rectangle(5, 5, 230, 28,
+                            Color(0, 65, 30));
+
+        it.print(10, 11, id(terminal_font),
+                 Color(0, 255, 90), tr("WEATHER", "WETTER"));
+
+        std::string place = id(w_city).empty() ? id(weather_plz).state : id(w_city);
+        if (place.length() > 12)
+          place.resize(12);
+        it.printf(230, 11, id(terminal_font),
+                  Color(0, 200, 90),
+                  TextAlign::TOP_RIGHT, "%s", place.c_str());
+
+        // ---------- indoor / outdoor (outdoor falls back to the internet value when nothing fresh was sent) ----------
+        uint32_t tmo = ${temp_timeout_min} * 60000UL;
+        float t_in = (id(t_in_ms) != 0 && millis() - id(t_in_ms) < tmo) ? id(temp_indoor).state : NAN;
+        float t_out = (id(t_out_ms) != 0 && millis() - id(t_out_ms) < tmo) ? id(temp_outdoor).state : NAN;
+        if (std::isnan(t_out) && id(w_valid))
+          t_out = id(w_temp);
+        auto temp = [&](int x, const char *label, float t, Color c) {
+          it.print(x, 40, id(terminal_font), Color(0, 180, 70),
+                   TextAlign::TOP_CENTER, label);
+          if (std::isnan(t))
+            it.print(x, 60, id(value_font), c, TextAlign::TOP_CENTER, "--");
+          else
+            it.printf(x, 60, id(value_font), c, TextAlign::TOP_CENTER, "%.1f°", t);
+        };
+        temp(62, tr("INDOOR", "INNEN"), t_in, Color(255, 180, 60));
+        temp(178, tr("OUTDOOR", "AUSSEN"), t_out, Color(90, 200, 255));
+        it.line(120, 42, 120, 96, Color(0, 100, 40));
+        it.line(15, 100, 225, 100, Color(0, 100, 40));
+
+        if (id(w_valid) && id(w_dcode).size() >= 1) {
+          // ---------- icon helpers ----------
+          auto sun = [&](int x, int y, int r) {
+            it.filled_circle(x, y, r, Color(255, 200, 0));
+            for (int a = 0; a < 8; a++) {
+              float an = a * M_PI / 4.0f;
+              it.line(x + cosf(an) * (r + 2), y + sinf(an) * (r + 2),
+                      x + cosf(an) * (r + 5), y + sinf(an) * (r + 5), Color(255, 200, 0));
+            }
+          };
+          auto cloud = [&](int x, int y, int u, Color c) {
+            it.filled_circle(x - u * 7 / 10, y + u / 5, u * 6 / 10, c);
+            it.filled_circle(x, y - u / 5, u * 8 / 10, c);
+            it.filled_circle(x + u * 8 / 10, y + u / 5, u * 6 / 10, c);
+            it.filled_rectangle(x - u * 7 / 10, y + u / 5, u * 15 / 10, u * 6 / 10, c);
+          };
+          // c = WMO weather code from Open-Meteo
+          auto icon = [&](int x, int y, int u, int c) {
+            Color grey(170, 180, 200), dark(120, 130, 150);
+            if (c <= 2) {
+              if (c == 0) {
+                sun(x, y, u * 6 / 10);
+              } else {
+                sun(x + u * 4 / 10, y - u * 4 / 10, u * 5 / 10);
+                cloud(x - u * 2 / 10, y + u * 3 / 10, u * 7 / 10, grey);
+              }
+            } else if (c == 45 || c == 48) {
+              for (int k = -1; k <= 1; k++)
+                it.line(x - u, y + k * u / 2, x + u, y + k * u / 2, grey);
+            } else if ((c >= 51 && c <= 67) || (c >= 80 && c <= 82)) {
+              cloud(x, y - u / 4, u * 9 / 10, dark);
+              for (int k = -1; k <= 1; k++)
+                it.line(x + k * u / 2, y + u * 6 / 10, x + k * u / 2 - 2, y + u * 11 / 10,
+                        Color(60, 150, 255));
+            } else if ((c >= 71 && c <= 77) || c == 85 || c == 86) {
+              cloud(x, y - u / 4, u * 9 / 10, grey);
+              for (int k = -1; k <= 1; k++)
+                it.filled_circle(x + k * u / 2, y + u * 9 / 10, u / 8 + 1, Color(240, 245, 255));
+            } else if (c >= 95) {
+              cloud(x, y - u / 4, u * 9 / 10, dark);
+              it.line(x + u / 5, y + u * 5 / 10, x - u / 5, y + u * 8 / 10, Color(255, 220, 0));
+              it.line(x - u / 5, y + u * 8 / 10, x + u / 5, y + u * 12 / 10, Color(255, 220, 0));
+            } else {
+              cloud(x, y, u, grey);
+            }
+          };
+          auto cond = [de](int c) -> const char * {
+            if (c == 0) return de ? "Klar" : "Clear";
+            if (c <= 2) return de ? "Teils wolkig" : "Part cloudy";
+            if (c == 3) return de ? "Bedeckt" : "Cloudy";
+            if (c == 45 || c == 48) return de ? "Nebel" : "Fog";
+            if (c >= 51 && c <= 57) return de ? "Nieselregen" : "Drizzle";
+            if (c >= 61 && c <= 67) return de ? "Regen" : "Rain";
+            if (c >= 71 && c <= 77) return de ? "Schnee" : "Snow";
+            if (c >= 80 && c <= 82) return de ? "Schauer" : "Showers";
+            if (c == 85 || c == 86) return de ? "Schneefall" : "Snow showers";
+            if (c >= 95) return de ? "Gewitter" : "Thunder";
+            return de ? "Bedeckt" : "Cloudy";
+          };
+
+          // ---------- now + today high/low ----------
+          icon(40, 132, 16, id(w_code));
+          it.print(78, 110, id(medium_font), Color(0, 255, 90),
+                   TextAlign::TOP_LEFT, cond(id(w_code)));
+          it.printf(78, 136, id(terminal_font), Color(0, 200, 90),
+                    TextAlign::TOP_LEFT, de ? "Hoch %.0f°  Tief %.0f°" : "H %.0f°  L %.0f°",
+                    id(w_dmax)[0], id(w_dmin)[0]);
+          it.line(15, 162, 225, 162, Color(0, 100, 40));
+
+          // ---------- next 3 days ----------
+          static const char *wd3_en[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+          static const char *wd3_de[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+          auto now = id(sntp_time).now();
+          int wd0 = now.is_valid() ? now.day_of_week - 1 : 0;
+          for (int i = 1; i <= 3 && i < (int) id(w_dcode).size(); i++) {
+            int cx = 40 + (i - 1) * 80;
+            it.printf(cx, 168, id(terminal_font), Color(0, 200, 90),
+                      TextAlign::TOP_CENTER, "%s", (de ? wd3_de : wd3_en)[(wd0 + i) % 7]);
+            icon(cx, 196, 9, id(w_dcode)[i]);
+            it.printf(cx, 212, id(terminal_font), Color(0, 255, 90),
+                      TextAlign::TOP_CENTER, "%.0f/%.0f°", id(w_dmax)[i], id(w_dmin)[i]);
+          }
+        } else {
+          it.print(120, 110, id(terminal_font), Color(0, 255, 90),
+                   TextAlign::TOP_CENTER, tr("NO DATA", "KEINE DATEN"));
+          it.printf(120, 135, id(terminal_font), Color(0, 200, 90),
+                    TextAlign::TOP_CENTER, "%s",
+                    id(w_status).empty() ? tr("NO UPDATE YET", "NOCH KEIN UPDATE") : id(w_status).c_str());
+        }
+      }
+
+      // PAGE 8: MOON PHASE (calculated from the date, no internet needed)
+      else if (id(screen_page) == 8) {
+        it.rectangle(4, 4, 232, 232,
+                     Color(0, 180, 70));
+
+        it.filled_rectangle(5, 5, 230, 28,
+                            Color(0, 65, 30));
+
+        it.print(10, 11, id(terminal_font),
+                 Color(0, 255, 90), tr("MOON PHASE", "MONDPHASE"));
+
+        auto now = id(sntp_time).now();
+        if (!now.is_valid()) {
+          it.print(120, 120, id(terminal_font), Color(0, 255, 90),
+                   TextAlign::TOP_CENTER, tr("NO TIME", "KEINE UHRZEIT"));
+        } else {
+          // days since the new moon of 2000-01-06 18:14 UTC, mean synodic month (good to about half a day)
+          const float syn = 29.530588853f;
+          double cyc = ((double) now.timestamp - 947182440.0) / 86400.0 / syn;
+          float p = (float) (cyc - floor(cyc));  // 0 = new, 0.5 = full
+          float k = cosf(2.0f * M_PI * p);
+
+          // disc: dark base, lit part per scanline (waxing = lit on the right)
+          const int cx = 120, cy = 92, r = 54;
+          for (int dy = -r; dy <= r; dy++) {
+            int w = (int) sqrtf((float) (r * r - dy * dy));
+            int xt = (int) (k * w);
+            int a = p < 0.5f ? xt : -w;
+            int b = p < 0.5f ? w : -xt;
+            it.line(cx - w, cy + dy, cx + w, cy + dy, Color(35, 38, 50));
+            if (b > a)
+              it.line(cx + a, cy + dy, cx + b, cy + dy, Color(238, 235, 205));
+          }
+          it.circle(cx, cy, r, Color(90, 95, 115));
+
+          const char *name = tr("New Moon", "Neumond");
+          if (p >= 0.97f)      name = tr("New Moon", "Neumond");
+          else if (p >= 0.78f) name = tr("Waning Crescent", "Abnehmende Sichel");
+          else if (p >= 0.72f) name = tr("Last Quarter", "Letztes Viertel");
+          else if (p >= 0.53f) name = tr("Waning Gibbous", "Abnehmender Mond");
+          else if (p >= 0.47f) name = tr("Full Moon", "Vollmond");
+          else if (p >= 0.28f) name = tr("Waxing Gibbous", "Zunehmender Mond");
+          else if (p >= 0.22f) name = tr("First Quarter", "Erstes Viertel");
+          else if (p >= 0.03f) name = tr("Waxing Crescent", "Zunehmende Sichel");
+          it.print(120, 156, id(medium_font), Color(0, 255, 90),
+                   TextAlign::TOP_CENTER, name);
+
+          float to_full = (p < 0.5f ? 0.5f - p : 1.5f - p) * syn;
+          float to_new = (1.0f - p) * syn;
+          it.printf(120, 186, id(terminal_font), Color(0, 200, 90),
+                    TextAlign::TOP_CENTER, de ? "HELL %.0f%%   ALTER %.1f T" : "LIT %.0f%%   AGE %.1f d", (1.0f - k) * 50.0f, p * syn);
+          it.printf(120, 204, id(terminal_font), Color(0, 200, 90),
+                    TextAlign::TOP_CENTER, de ? "VOLL %.0f T   NEU %.0f T" : "FULL %.0f d   NEW %.0f d", to_full, to_new);
+        }
+      }
+
+      // PAGE 9: TEA TIMER (touch: hold = +step, longer = start/pause, longest = reset)
+      else if (id(screen_page) == 9) {
+        uint32_t nowm = millis();
+        int st = id(timer_state);
+
+        if (st == 3) {
+          // alarm: flashing until touched
+          bool blink = (nowm / 500) % 2;
+          Color bg = blink ? Color(0, 200, 80) : Color(0, 0, 0);
+          Color fg = blink ? Color(0, 0, 0) : Color(0, 255, 90);
+          it.filled_rectangle(0, 0, 240, 240, bg);
+          it.print(120, 85, id(value_font), fg, TextAlign::TOP_CENTER, tr("TEA READY!", "TEE FERTIG!"));
+          it.print(120, 130, id(terminal_font), fg, TextAlign::TOP_CENTER, tr("TOUCH = OK", "BERUEHREN = OK"));
+        } else {
+          it.rectangle(4, 4, 232, 232,
+                       Color(0, 180, 70));
+
+          it.filled_rectangle(5, 5, 230, 28,
+                              Color(0, 65, 30));
+
+          it.print(10, 11, id(terminal_font),
+                   Color(0, 255, 90), tr("TEA TIMER", "TEE-TIMER"));
+          it.print(230, 11, id(terminal_font),
+                   Color(0, 200, 90), TextAlign::TOP_RIGHT,
+                   st == 1 ? tr("RUNNING", "LAEUFT") : (st == 2 ? tr("PAUSED", "PAUSE") : tr("READY", "BEREIT")));
+
+          int32_t rem;
+          if (st == 1)
+            rem = (int32_t) (id(timer_end_ms) - nowm);
+          else if (st == 2)
+            rem = (int32_t) id(timer_rem_ms);
+          else
+            rem = id(timer_set_s) * 1000;
+          if (rem < 0)
+            rem = 0;
+          int secs = (rem + 999) / 1000;
+          Color tc = st == 1 ? Color(0, 255, 90) : (st == 2 ? Color(255, 200, 0) : Color(90, 200, 255));
+          it.printf(120, 36, id(clock_big_font), tc, TextAlign::TOP_CENTER,
+                    "%02d:%02d", secs / 60, secs % 60);
+
+          // progress bar (full = whole time left)
+          float frac = (st == 0 || id(timer_total_ms) == 0) ? 1.0f : rem / (float) id(timer_total_ms);
+          if (frac > 1.0f)
+            frac = 1.0f;
+          it.rectangle(12, 128, 216, 8, Color(0, 100, 40));
+          it.filled_rectangle(12, 128, (int) (frac * 216), 8, tc);
+
+          // legend, the stage reached by the current hold is highlighted
+          uint32_t held = id(touch_button).state ? nowm - id(push_ts) : 0;
+          int stage = held >= ${timer_reset_ms} ? 3 : (held >= ${timer_start_ms} ? 2 : (held >= ${long_press_ms} ? 1 : 0));
+          auto leg = [&](int y, int s, const char *txt) {
+            if (stage == s)
+              it.filled_rectangle(12, y - 2, 216, 18, Color(0, 65, 30));
+            it.print(120, y, id(terminal_font), stage == s ? Color(0, 255, 90) : Color(0, 120, 50),
+                     TextAlign::TOP_CENTER, txt);
+          };
+          leg(146, 1, tr("HOLD: +${timer_step_s}s", "HALTEN: +${timer_step_s}s"));
+          leg(166, 2, st == 1 ? tr("LONGER: PAUSE", "LAENGER: PAUSE") : tr("LONGER: START", "LAENGER: START"));
+          leg(186, 3, tr("LONGEST: RESET", "AM LAENGSTEN: RESET"));
+          it.print(120, 210, id(terminal_font), Color(0, 100, 40),
+                   TextAlign::TOP_CENTER, tr("TAP = NEXT PAGE", "TIPPEN = WEITER"));
+        }
       }
     invert_colors: true
