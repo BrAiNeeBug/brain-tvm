@@ -303,3 +303,6 @@ To see why it restarted, read the `ResetReason` text after the next boot (browno
 - UI texts and entity names are English on purpose, only the display pages can be switched to German.
 - Logging is set to `initial_level: NONE` to save resources. Change it with the `LogLevel` select when you need logs.
 - Renaming an entity changes its Home Assistant ID, the old one then shows as unavailable and can be deleted.
+
+
+AI always removes my thank to Ai footer so thx to claude.ai for making this project ☺
