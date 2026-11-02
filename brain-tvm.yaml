@@ -30,14 +30,17 @@ substitutions:
   page_count: "10"
   # Weather page: default PLZ (change it at runtime with the WeatherPLZ text entity) and country code
   weather_plz_default: "10115"
-  # Weather page: you can also use you state/town name
+  # you can also use you state/town name
   # weather_plz_default: "Berlin"
   weather_country: "DE"
-  # Tea timer page (touch): hold = +step, longer hold = start/pause, longest hold = reset
+  # Tea timer page (touch): hold = +step, longer hold = start/pause, longest hold = reset to timer_default_s
+  timer_default_s: "180"
   timer_step_s: "30"
   timer_max_min: "15"
   timer_start_ms: "1500"
   timer_reset_ms: "3000"
+  # Card page: duration of the Pac-Man animation (hold) that eats the card, then the card is cleared
+  pac_duration_ms: "1800"
   # WiFi page: the QR code (shown on hold) hides itself again after this many seconds
   qr_show_s: "30"
   # Indoor / outdoor temperature sent to the device (TempIndoor / TempOutdoor numbers) counts as
@@ -225,7 +228,7 @@ script:
             };
             static const size_t max_chars[4] = {26, 18, 12, 9};
 
-            std::string title = x.containsKey("title") ? x["title"].as<std::string>() : std::string("");
+            std::string title = !x["title"].isNull() ? x["title"].as<std::string>() : std::string("");
             if (title.length() > 24)
               title.resize(24);
             id(card_title) = title;
@@ -235,14 +238,14 @@ script:
             for (int i = 1; i <= 8; i++) {
               char key[12];
               snprintf(key, sizeof(key), "line%d", i);
-              if (!x.containsKey(key))
+              if (x[key].isNull())
                 continue;
               std::string text = x[key].as<std::string>();
               if (text.empty())
                 continue;
 
               snprintf(key, sizeof(key), "size%d", i);
-              int code = x.containsKey(key) ? size_code(x[key].as<std::string>()) : 2;
+              int code = !x[key].isNull() ? size_code(x[key].as<std::string>()) : 2;
 
               if (text.length() > max_chars[code])
                 text.resize(max_chars[code]);
@@ -252,7 +255,7 @@ script:
 
             id(card_received) = true;
 
-            if (x.containsKey("show") && x["show"].as<bool>()) {
+            if (x["show"].as<bool>()) {
               id(screen_page) = 2;
               id(rotate_counter) = 0;
             }
@@ -277,6 +280,16 @@ script:
             id(screen_page) = 2;
             id(rotate_counter) = 0;
           }
+
+  # Reboot with a short notice on the display (hold on the status page)
+  - id: reboot_device
+    mode: single
+    then:
+      - lambda: |-
+          id(boot_notice) = 3;
+      - component.update: main_display
+      - delay: 1s
+      - button.press: restart_btn
 
   # Next page. Only pages listed in EnabledPages are used (touch + rotation).
   # rotate = true (auto rotation): the page must also be listed in RotatePages and the card page
@@ -542,6 +555,12 @@ globals:
     restore_value: false
     initial_value: "false"
 
+  # Card page: millis() at which the Pac-Man animation started (0 = off)
+  - id: pac_start
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
   # Weather: location (kept in flash, geocoded from the PLZ), current values, forecast (today + 3 days)
   - id: w_lat
     type: float
@@ -607,7 +626,7 @@ globals:
   - id: timer_set_s
     type: int
     restore_value: true
-    initial_value: "180"
+    initial_value: "${timer_default_s}"
 
   # running: millis() at which the timer ends / paused: milliseconds left / total of the current run (progress bar)
   - id: timer_end_ms
@@ -708,7 +727,9 @@ binary_sensor:
               // tea timer: the length of the hold decides (the display shows the current stage)
               uint32_t now = millis();
               if (held >= ${timer_reset_ms}) {
+                // reset: stop and go back to the default time (not the last set value)
                 id(timer_state) = 0;
+                id(timer_set_s) = ${timer_default_s};
               } else if (held >= ${timer_start_ms}) {
                 if (id(timer_state) == 1) {
                   int32_t left = (int32_t) (id(timer_end_ms) - now);
@@ -1040,6 +1061,7 @@ text:
 button:
   - platform: restart
     name: "Restart"
+    id: restart_btn
     device_class: restart
     entity_category: diagnostic
     disabled_by_default: true
@@ -1350,6 +1372,21 @@ interval:
   - interval: 50ms
     then:
       - lambda: |-
+          // Pac-Man animation on the card page: when it is done, clear the card and move on
+          // (page changed meanwhile = animation cancelled, card stays)
+          if (id(pac_start) != 0) {
+            if (id(screen_page) != 2) {
+              id(pac_start) = 0;
+            } else if (millis() - id(pac_start) >= ${pac_duration_ms}) {
+              id(pac_start) = 0;
+              id(card_title) = "CARD";
+              id(card_lines).clear();
+              id(card_sizes).clear();
+              id(card_received) = false;
+              id(card_json).publish_state("");
+              id(page_step).execute(false);
+            }
+          }
           // night mode (clock dimmer active = brightness at dim_low): clock page only
           if ((id(backlight_pct).state <= ${dim_low}) && id(screen_page) != 3) {
             id(screen_page) = 3;
@@ -1358,14 +1395,17 @@ interval:
           static uint32_t last = 0;
           uint32_t now = millis();
           uint32_t period = (id(screen_page) == 3 || id(screen_page) == 9) ? 250 : 500;
+          if (id(pac_start) != 0)
+            period = 50;
           if (now - last >= period) {
             last = now;
             id(main_display).update();
           }
 
   # Hold detection: after long_press_ms the page button of the current page goes active
-  # (clock page: toggles the dimmer = night mode, only the clock is shown while dimmed;
-  #  WiFi page: toggles the QR code)
+  # (welcome: language, status: reboot, card: Pac-Man eats + clears the card, BLE: scanner on/off,
+  #  light: push button, clock page: toggles the dimmer = night mode, only the clock is shown while dimmed;
+  #  WiFi page: toggles the QR code, weather <-> moon page, tea timer: see the release handler)
   - interval: 50ms
     then:
       - lambda: |-
@@ -1375,13 +1415,40 @@ interval:
             return;
           id(push_long) = true;
           id(rotate_counter) = 0;
-          if (id(screen_page) == 5)
+          // page at the time of the hold (a hold action may switch the page itself)
+          const int pg = id(screen_page);
+          if (pg == 0) {
+            // welcome page: hold switches the language (English <-> German)
+            auto lang = id(clock_lang).make_call();
+            lang.select_next(true);
+            lang.perform();
+          } else if (pg == 1) {
+            // status page: hold reboots the device
+            id(reboot_device).execute();
+          } else if (pg == 2) {
+            // card page: hold starts the Pac-Man animation, it eats the card (see the display refresh interval)
+            if (id(pac_start) == 0) {
+              uint32_t n = millis();
+              id(pac_start) = n ? n : 1;
+            }
+          } else if (pg == 4) {
+            // BLE page: hold switches the scanner on / off
+            id(ble_scan_switch).toggle();
+          }
+          if (pg == 5)
             id(push_light).publish_state(true);
-          if (id(screen_page) == 6) {
+          if (pg == 6) {
             id(wifi_qr_show) = !id(wifi_qr_show);
             id(wifi_qr_ms) = millis();
           }
-          if (id(screen_page) == 3) {
+          if (pg == 7) {
+            // weather page: hold jumps to the moon page (works even if it is not enabled / in the rotation)
+            id(screen_page) = 8;
+          } else if (pg == 8) {
+            // moon page: hold jumps back to the weather page
+            id(screen_page) = 7;
+          }
+          if (pg == 3) {
             // dimmed -> back to the brightness from before, otherwise remember it and dim
             float cur = id(backlight_pct).state;
             float target;
@@ -1511,6 +1578,16 @@ display:
           it.print(120, 197, id(terminal_font),
                    Color(255, 200, 80),
                    TextAlign::TOP_CENTER, tr("OR WAIT FOR REBOOT", "ODER AUF NEUSTART WARTEN"));
+        } else if (id(boot_notice) == 3) {
+          it.print(120, 30, id(value_font),
+                   Color(255, 160, 0),
+                   TextAlign::TOP_CENTER, tr("REBOOT", "NEUSTART"));
+
+          it.line(15, 105, 225, 105, Color(120, 80, 0));
+
+          it.print(120, 125, id(terminal_font),
+                   Color(255, 200, 80),
+                   TextAlign::TOP_CENTER, tr("REBOOTING...", "STARTE NEU..."));
         } else {
           it.print(120, 30, id(value_font),
                    Color(255, 160, 0),
@@ -1552,6 +1629,10 @@ display:
         it.print(120, 185, id(terminal_font),
                  Color(0, 200, 90),
                  TextAlign::TOP_CENTER, tr("> NEXT PAGE", "> WEITER"));
+
+        it.print(120, 207, id(terminal_font),
+                 Color(0, 120, 50),
+                 TextAlign::TOP_CENTER, tr("HOLD = LANGUAGE", "HALTEN = SPRACHE"));
       }
 
       // PAGE 1: SYSTEM STATUS
@@ -1583,6 +1664,10 @@ display:
 
         snprintf(buf, sizeof(buf), de ? "%d Geraete" : "%d devices", id(ble_count));
         row(164, "BLE", buf);
+
+        it.print(120, 207, id(terminal_font),
+                 Color(0, 120, 50),
+                 TextAlign::TOP_CENTER, tr("HOLD = REBOOT", "HALTEN = NEUSTART"));
       }
 
       // PAGE 2: CARD (title + up to 8 lines, font size per line)
@@ -1639,6 +1724,39 @@ display:
 
           it.print(12, 105, id(terminal_font),
                    Color(0, 180, 70), tr("Card text entity", "Card-Textfeld"));
+        }
+
+        // Pac-Man runs from left to right and eats everything behind him (hold)
+        if (id(pac_start) != 0) {
+          uint32_t el = millis() - id(pac_start);
+          float t = el / (float) ${pac_duration_ms};
+          if (t > 1.0f)
+            t = 1.0f;
+          const int r = 40;
+          const int cy = 120;
+          int cx = (int) (-r + t * (240 + 2 * r));
+
+          // eaten area = black
+          if (cx > 0)
+            it.filled_rectangle(0, 0, cx > 240 ? 240 : cx, 240, Color(0, 0, 0));
+
+          // chomping mouth (half opening angle in rad)
+          float mouth = 0.08f + 0.62f * fabsf(sinf(el * 0.0105f));
+          float tn = tanf(mouth);
+          Color pac(255, 210, 0);
+          // body: one horizontal line per row, mouth wedge cut out on the right side
+          for (int dy = -r; dy <= r; dy++) {
+            float dx = sqrtf((float) (r * r - dy * dy));
+            float cut = fabsf((float) dy) / tn;  // right end of the row (wedge = mouth)
+            float right = cut < dx ? cut : dx;
+            int x0 = cx - (int) dx;
+            int w = (int) (dx + right) + 1;
+            if (x0 + w <= 0 || x0 >= 240)
+              continue;
+            it.horizontal_line(x0, cy + dy, w, pac);
+          }
+          // eye
+          it.filled_circle(cx + r / 6, cy - r / 2, 3, Color(0, 0, 0));
         }
       }
 
