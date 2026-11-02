@@ -1,4 +1,4 @@
-#giturl: "https://github.com/BrAiNeeBug"
+#giturl: "https://github.com/BrAiNeeBug/brain-tvm/"
 substitutions:
   # Values are pasted as plain text. Everything is quoted for consistency.
   # Options that expect a time need the unit ("80ms"); values used inside C++ lambdas
