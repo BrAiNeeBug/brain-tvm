@@ -1,24 +1,24 @@
-# brain-tvm (Full EN/DE Language Support)
+# brain-tvm
 
 ESPHome firmware for a small ESP32 display device: a 240x240 ST7789 screen with one touch button, showing a colorful clock, system status, a BLE device counter with tracker detection, a free-form info card, a WiFi monitor with QR code, weather, the moon phase and a tea timer. Everything is controlled from Home Assistant or the built-in web UI.
 
+One YAML file, no custom C++ components.
 <img width="2087" height="2887" alt="image" src="https://github.com/user-attachments/assets/ae8df9e7-5333-4bab-bb60-e013203072ba" />
-
 ## Features
 
 - **10 display pages** (neon green theme, the clock page is in color): Welcome, Status, Card, Clock, BLE scanner, Light, WiFi monitor, Weather, Moon phase, Tea timer
 - **Colorful clock**: rainbow seconds ring, gradient digits with a fading colon, weekday in its own color and a day progress bar. Digits and bar share a palette (green/blue/purple by day, dark red by night) that you can shift with the `ClockBarHue` slider
-- **Touch button**: short tap = next page, hold = action of the current page (dimmer on the clock page, `PushLight` on the light page, QR code on the WiFi page, timer control on the tea timer page)
+- **Touch button**: short tap = next page, hold = action of the current page: language switch, reboot, Pac-Man card clearing, BLE scanner on/off, dimmer, `PushLight`, QR code, weather / moon switch or tea timer control, see [Touch](#touch)
 - **Night mode**: dim the clock page and the device shows only the clock, whatever else is set
 - **Page selection at runtime**: `EnabledPages` decides which pages can be reached at all (touch and rotation), `RotatePages` which ones take part in the auto rotation
 - **Spike filter** for the touch input (`touch_delay`), plus an adjustable trigger level (`touch_threshold`) for each device
 - **Language switch** English/German (`Language`) for all display pages, NTP time
-- **Card page**: send a JSON to the `Card` text entity and it shows title and up to 8 lines in 4 sizes
+- **Card page**: send a JSON to the `Card` text entity and it shows title and up to 8 lines in 4 sizes. Hold and Pac-Man eats the card away
 - **BLE scanner** counting nearby devices (current and peak), can be switched on and off
 - **Tracker detection**: spots AirTag / Find My, Samsung SmartTag, Tile, Chipolo and Google Find My Device trackers and raises an alert when one stays around
 - **WiFi monitor** with signal graph and a QR code to join the network
 - **Weather** (Open-Meteo, no API key) with indoor / outdoor temperature from Home Assistant
-- **Tea timer** operated by touch, with a ringing alarm and a `TimerRinging` sensor for notifications
+- **Tea timer** operated by touch, with a ringing alarm, a reset to the default time and a `TimerRinging` sensor for notifications
 - **Web UI** (v3) with groups, plus OTA, safe mode and encrypted API
 - **Safe mode restart with notice**: the display shows a BOOTMODE hint before the device reboots into safe mode
 - Brightness, rotate interval, clock colors and more as runtime entities, no reflash needed
@@ -66,7 +66,7 @@ All values are plain text that gets pasted into the config, so they are all quot
 | `touch_delay` | `50ms` | Touch must be active this long to count |
 | `touch_threshold` | `1450` | Touch trigger level, the pad counts as touched when its raw value drops below this |
 | `touch_setup_mode` | `false` | `true` logs the raw touch values, see [Touch](#touch) |
-| `long_press_ms` | `600` | Hold time in ms |
+| `long_press_ms` | `600` | Hold time in ms for the page action |
 | `date_bright_pct` | `50` | Brightness (%) of weekday and date on the clock page, the time digits are always at full brightness |
 | `dim_low` | `5` | Backlight level (%) the clock page dimmer goes down to, at or below this level night mode is active |
 | `ble_interval`, `ble_window` | `160ms`, `120ms` | BLE scan timing, the window must be smaller than the interval so WiFi keeps some airtime |
@@ -76,10 +76,12 @@ All values are plain text that gets pasted into the config, so they are all quot
 | `page_count` | `10` | Number of display pages |
 | `weather_plz_default` | `10115` | Default location of the weather page, a PLZ or a state / town name (e.g. `"Berlin"`), change it at runtime with `WeatherPLZ` |
 | `weather_country` | `DE` | Country code used when a PLZ or city name is geocoded |
+| `timer_default_s` | `180` | Tea timer: default time, the reset goes back to this value (also the start value on a fresh install) |
 | `timer_step_s` | `30` | Tea timer: seconds added per hold |
 | `timer_max_min` | `15` | Tea timer: longest time you can set |
 | `timer_start_ms` | `1500` | Tea timer: hold time for start / pause |
 | `timer_reset_ms` | `3000` | Tea timer: hold time for reset |
+| `pac_duration_ms` | `1800` | Card page: how long the Pac-Man animation takes before the card is cleared |
 | `qr_show_s` | `30` | The QR code on the WiFi page hides itself after this many seconds |
 | `temp_timeout_min` | `30` | `TempIndoor` / `TempOutdoor` count as valid for this many minutes |
 
@@ -87,15 +89,15 @@ All values are plain text that gets pasted into the config, so they are all quot
 
 | # | Page | Content |
 |---|---|---|
-| 1 | Welcome | "WELCOME", "HA DASHBOARD", "TOUCH ME" and a hint to tap for the next page |
-| 2 | Status | Host, IP, MAC, uptime, free heap, ESPHome version, build date, BLE count |
-| 3 | Card | Content you send to the `Card` entity (in the auto rotation only once something was sent) |
+| 1 | Welcome | "WELCOME", "HA DASHBOARD", "TOUCH ME", a hint to tap for the next page and one for the language hold. Hold switches the language |
+| 2 | Status | Host, IP, MAC, uptime, free heap, ESPHome version, build date, BLE count. Hold reboots the device |
+| 3 | Card | Content you send to the `Card` entity (in the auto rotation only once something was sent). Hold: Pac-Man eats the card and clears it |
 | 4 | Clock | Seconds ring, weekday, time, day progress bar and date |
-| 5 | BLE | Number of BLE devices around, peak and tracker count (frame turns orange on alert) |
+| 5 | BLE | Number of BLE devices around, peak and tracker count (frame turns orange on alert). Hold switches the scanner on / off |
 | 6 | Light | Static light page, `PushLight` is active while you hold the touch |
 | 7 | WiFi | Signal in dBm and %, 2 minute graph, min / avg / max, SSID, BSSID, channel, IP. Hold shows the QR code |
-| 8 | Weather | Indoor and outdoor temperature, current conditions with icon, today's high / low and the next 3 days |
-| 9 | Moon | Moon phase drawn as a disc, phase name, lit percentage, age and days to full / new moon |
+| 8 | Weather | Indoor and outdoor temperature, current conditions with icon, today's high / low and the next 3 days. Hold jumps to the moon page |
+| 9 | Moon | Moon phase drawn as a disc, phase name, lit percentage, age and days to full / new moon. Hold jumps back to the weather page |
 | 10 | Timer | Tea timer, see [Tea timer](#tea-timer) |
 
 Pages can be changed with the `DisplayPage` select.
@@ -105,15 +107,15 @@ Pages can be changed with the `DisplayPage` select.
 - `EnabledPages` (default `1-10`): pages that can be reached at all. A page that is not listed is skipped by touch and by the auto rotation, for example `1-9` hides the tea timer.
 - `RotatePages` (default `3,4`): pages that take part in the auto rotation, on top of `EnabledPages`. `RotateInterval` sets the time per page, 0 turns the rotation off.
 
-Pages that are not enabled can still be reached on purpose: with the `DisplayPage` select, with `"show": true` from the card, and by the tea timer alarm.
+Pages that are not enabled can still be reached on purpose: with the `DisplayPage` select, with `"show": true` from the card, by the tea timer alarm and by the hold on the weather / moon page (so the moon page works even if it is not in `EnabledPages` or the rotation).
 
-The display refreshes every 250 ms on the clock and timer pages (smooth ring, colon fade and countdown) and every 500 ms on all other pages.
+The display refreshes every 250 ms on the clock and timer pages (smooth ring, colon fade and countdown), every 50 ms while the Pac-Man animation runs and every 500 ms on all other pages.
 
 On the status page, characters the font cannot draw (for example emoji in an SSID) are shown as `_`, so they do not flood the log with missing-glyph warnings. The real values stay unchanged in the web UI and Home Assistant.
 
 ## Language
 
-The `Language` select switches all display pages between English and German. German texts use ae/oe/ue because the fonts have no umlauts. Dates and weekdays on the clock page follow it too.
+The `Language` select switches all display pages between English and German. A hold on the welcome page switches it too (the choice is stored, so it survives a reboot). German texts use ae/oe/ue because the fonts have no umlauts. Dates and weekdays on the clock page follow it too.
 
 ## Clock page
 
@@ -140,11 +142,15 @@ Night mode has no switch of its own, it is the dimmer of the clock page: as soon
 
 - **Short tap** (on release): next page, only pages from `EnabledPages` (not in night mode)
 - **Hold** (`long_press_ms`, default 600 ms), depends on the page:
+  - Welcome page: switches the language between English and German.
+  - Status page: reboots the device. The display shows a short `REBOOT` notice first (same as the `Restart` button).
+  - Card page: Pac-Man runs over the page and eats the card, then the card is cleared (the `Card` entity is emptied too) and the display moves on. A tap or a page change during the animation cancels it and the card stays. Duration: `pac_duration_ms`.
   - Clock page: dimmer toggle (night mode), see above.
+  - BLE page: switches the scanner on or off, the same as the `BLEScanner` switch.
   - Light page: `PushLight` goes active until you release, use it as a trigger in Home Assistant.
   - WiFi page: shows the QR code or hides it again. It also hides itself after `qr_show_s` seconds.
+  - Weather page: jumps to the moon page, a hold there jumps back. It works even if the moon page is not enabled.
   - Timer page: controls the tea timer, see [Tea timer](#tea-timer).
-  - Other pages: nothing, the hold does not change the page.
 - `touch_delay` (default 50 ms): the touch must be active at least this long. If short noise spikes switch pages, raise it, for example to 60 ms.
 
 **Calibrating `touch_threshold`**: the raw touch value differs per device, wiring and case. The pad counts as touched when the value drops below the threshold, so it belongs between the idle and the touched value.
@@ -160,6 +166,8 @@ Example from one device: idle about 1620, touched about 1295, threshold 1450.
 ## BLE scanner
 
 The counter shows every address that advertised within the last `ble_timeout_s` seconds, plus the peak since boot (`ResetBLEPeak` resets it).
+
+The scanner can be switched on and off with the `BLEScanner` switch or by holding on the BLE page. Off clears the counts and the tracker list.
 
 The count always moves a bit, because many phones and wearables rotate their random MAC address. A longer `ble_timeout_s` calms the number, a shorter one reacts faster.
 
@@ -200,6 +208,8 @@ Send a JSON string to the `Card` text entity (max 255 characters). Every send re
 | `show` | `true` jumps to the card page, otherwise it only updates (ignored in night mode) |
 
 All keys are optional, missing keys are cleared. If the text is not valid JSON it is shown as one single line (max 12 chars).
+
+To get rid of a card on the device, hold the touch on the card page: Pac-Man eats it and the page is empty again (it shows `WAITING FOR DATA` and is skipped by the auto rotation until the next card arrives).
 
 Home Assistant:
 
@@ -253,7 +263,7 @@ Everything works with the touch button on page 10, the display highlights the st
 | Tap | Next page |
 | Hold (`long_press_ms`) | `+timer_step_s` seconds. Before the start this sets the time, after `timer_max_min` it wraps to the first step. While running or paused it adds time |
 | Hold longer (`timer_start_ms`) | Start, or pause while running |
-| Hold longest (`timer_reset_ms`) | Reset |
+| Hold longest (`timer_reset_ms`) | Reset: stops the timer and goes back to the default time `timer_default_s`, not to the last value you set |
 
 When the time is up, the display jumps to the timer page and flashes `TEA READY!`, and `TimerRinging` turns on (use it for a notification in Home Assistant). Any touch acknowledges the alarm.
 
@@ -264,7 +274,7 @@ Home Assistant sorts them by entity category:
 | Section in Home Assistant | Entities |
 |---|---|
 | **Controls** (everything for the display) | `DisplayPage`, `Card`, `Brightness`, `Language`, `ClockBarHue`, `RotateInterval`, `EnabledPages`, `RotatePages`, `WeatherPLZ`, `TempIndoor`, `TempOutdoor` |
-| **Configuration** (other things to click) | `BLEScanner` (switch), `ResetBLEPeak` (button) |
+| **Configuration** (other things to click) | `BLEScanner` (switch, also toggled by the hold on the BLE page), `ResetBLEPeak` (button) |
 | **Sensors** (display only) | `BLEDevices`, `BLEPeak`, `TrackerCount`, `TrackerInfo`, `TrackerAlert`, `Touch`, `PushLight`, `TimerRinging` |
 | **Diagnostic** | `IP`, `Uptime`, `DeviceInfo`, `ResetReason`, WiFi info (see below), `Restart`, `SafeModeRestart`, `LogLevel` |
 
@@ -273,7 +283,9 @@ Notes on single entities:
 | Entity | Purpose |
 |---|---|
 | `Touch` | Touch input (filtered) |
+| `Card` | The text is emptied when the card is cleared by the hold on the card page |
 | `PushLight` | Active while the touch is held on the light page |
+| `Restart` | Plain reboot, also used by the hold on the status page |
 | `TimerRinging` | On while the tea timer alarm is ringing |
 | `Brightness` | Backlight, default 50 % on a fresh install, also toggled by holding on the clock page. At or below `dim_low` night mode is active |
 | `ClockBarHue` | Shifts the hue of the clock bar and digits, 0 = default colors |
@@ -305,4 +317,3 @@ To see why it restarted, read the `ResetReason` text after the next boot (browno
 - Renaming an entity changes its Home Assistant ID, the old one then shows as unavailable and can be deleted.
 
 
-AI always removes my thank to Ai footer so thx to claude.ai for making this project ☺
